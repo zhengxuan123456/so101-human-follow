@@ -1,0 +1,103 @@
+{
+  "camera": {
+    "index": 0,
+    "width": 640,
+    "height": 480,
+    "fps": 30,
+    "rotation_degrees": 0.0,
+    "flip_horizontal": false,
+    "flip_vertical": false
+  },
+  "pose": {
+    "model_path": "models/pose_landmarker_lite.task",
+    "hand_model_path": "models/hand_landmarker.task",
+    "side": "right",
+    "min_detection_confidence": 0.5,
+    "min_presence_confidence": 0.5,
+    "min_tracking_confidence": 0.5,
+    "min_landmark_visibility": 0.5,
+    "hand_min_detection_confidence": 0.4,
+    "hand_min_presence_confidence": 0.4,
+    "hand_min_tracking_confidence": 0.4,
+    "max_hand_wrist_distance": 0.25,
+    "neutral_sample_count": 30
+  },
+  "robot": {
+    "port": "COM4",
+    "id": "my_follower_arm",
+    "control_hz": 10.0,
+    "max_relative_target": {
+      "shoulder_pan": 6.0,
+      "shoulder_lift": 6.0,
+      "elbow_flex": 6.0,
+      "wrist_flex": 6.0,
+      "wrist_roll": 6.0,
+      "gripper": 25.0
+    },
+    "disable_torque_on_disconnect": true
+  },
+  "mapping": {
+    "controlled_joints": [
+      "elbow_flex.pos",
+      "wrist_flex.pos",
+      "wrist_roll.pos",
+      "gripper.pos"
+    ],
+    "gains": {
+      "elbow_flex.pos": 100.0,
+      "wrist_flex.pos": 70.0,
+      "wrist_roll.pos": 90.0,
+      "gripper.pos": 100.0
+    },
+    "signs": {
+      "elbow_flex.pos": 1.0,
+      "wrist_flex.pos": 1.0,
+      "wrist_roll.pos": 1.0,
+      "gripper.pos": 1.0
+    },
+    "feature_deadbands": {
+      "elbow_flex.pos": 0.03,
+      "wrist_flex.pos": 0.03,
+      "wrist_roll.pos": 0.03,
+      "gripper.pos": 0.03
+    },
+    "fixed_joints": {
+      "mode": "startup",
+      "names": [
+        "shoulder_pan.pos",
+        "shoulder_lift.pos"
+      ],
+      "constant_values": {
+        "shoulder_pan.pos": 0.0,
+        "shoulder_lift.pos": 0.0
+      }
+    }
+  },
+  "safety": {
+    "ema_alpha": 0.55,
+    "max_step_per_cycle": 6.0,
+    "relative_limits": {
+      "elbow_flex.pos": 60.0,
+      "wrist_flex.pos": 90.0,
+      "wrist_roll.pos": 90.0,
+      "gripper.pos": 100.0
+    },
+    "absolute_limits": {
+      "shoulder_pan.pos": [-70.0, 70.0],
+      "shoulder_lift.pos": [-70.0, 70.0],
+      "elbow_flex.pos": [-70.0, 70.0],
+      "wrist_flex.pos": [-100.0, 100.0],
+      "wrist_roll.pos": [-100.0, 100.0],
+      "gripper.pos": [0.0, 100.0]
+    },
+    "startup_body_abs_limit": 200.0,
+    "valid_frames_before_arm": 3,
+    "tracking_timeout_s": 3.0,
+    "max_person_center_jump": 1.0,
+    "skip_safe_range_calibration": true
+  },
+  "viewer": {
+    "enabled": true,
+    "memory_limit": "10%"
+  }
+}

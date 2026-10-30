@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "so101-human-follow"
+version = "0.1.0"
+description = "Camera pose control prototype for a LeRobot SO-101 follower arm"
+readme = "README.md"
+requires-python = ">=3.10,<3.11"
+
+[project.optional-dependencies]
+web = ["Flask>=3.1,<4"]
+
+[project.scripts]
+so101-human-follow = "so101_human_follow.app:main"
+so101-human-follow-web = "so101_human_follow.web_app:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+so101_human_follow = ["templates/*.html", "static/*.js", "static/*.css"]
+

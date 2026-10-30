@@ -1,0 +1,4 @@
+# Install this only in a clone of the working `lerobot` Conda environment.
+# MediaPipe 1.x uses the current Tasks API and needs a separate .task model.
+mediapipe>=1.0,<2
+

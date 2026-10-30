@@ -1,0 +1,288 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <meta name="description" content="SO-101 从臂人体与手部姿态跟随本机控制台">
+    <title>SO-101 人体与手部跟随控制台</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-mark" aria-hidden="true">
+            <span></span><span></span><span></span>
+          </div>
+          <div>
+            <p class="eyebrow">LOCAL ROBOT CONTROL</p>
+            <h1>SO-101 人体与手部跟随控制台</h1>
+          </div>
+        </div>
+        <div class="top-status" aria-live="polite">
+          <span id="operatorBadge" class="badge badge-muted">正在获取控制权</span>
+          <span id="armBadge" class="badge badge-safe">DISARMED</span>
+        </div>
+      </header>
+
+      <main>
+        <section class="alert-strip" aria-label="安全提醒">
+          <span class="alert-icon" aria-hidden="true">!</span>
+          <div>
+            <strong>网页停止不是物理急停。</strong>
+            运行时请让机械臂实体电源开关保持触手可及；断开会释放扭矩，机械臂可能下坠。
+            必须先在预览中分别确认各控制通道识别稳定，再连接和 ARM；ID5 转动时还要留意摄像头线缆。
+          </div>
+        </section>
+
+        <div id="globalMessage" class="message-bar" role="status" aria-live="polite">
+          正在连接本机控制服务…
+        </div>
+
+        <div class="dashboard-grid">
+          <section class="panel camera-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-kicker">CAMERA · POSE + HAND</p>
+                <h2>实时人体与手部姿态</h2>
+              </div>
+              <span id="previewBadge" class="badge badge-muted">STARTING</span>
+            </div>
+
+            <div class="video-stage">
+              <img id="videoFeed" src="/video_feed" alt="摄像头人体与手部姿态识别画面">
+              <div id="videoFallback" class="video-fallback" hidden>
+                <span class="fallback-icon" aria-hidden="true">×</span>
+                <strong>暂时没有视频画面</strong>
+                <small>请检查相机、MediaPipe 依赖和后台状态</small>
+              </div>
+              <div class="video-overlay">
+                <span><i id="poseDot" class="signal-dot"></i><b id="poseSummary">等待人体与右手</b></span>
+                <span id="frameAge">帧延迟 —</span>
+              </div>
+            </div>
+
+            <div class="metric-grid" aria-label="视觉识别状态">
+              <article class="metric-card">
+                <span>检测结果</span>
+                <strong id="poseReason">—</strong>
+              </article>
+              <article class="metric-card">
+                <span>画面人数</span>
+                <strong id="peopleCount">—</strong>
+              </article>
+              <article class="metric-card">
+                <span>连续有效帧</span>
+                <strong id="validStreak">—</strong>
+              </article>
+              <article class="metric-card">
+                <span>最近发送</span>
+                <strong id="sendAge">—</strong>
+              </article>
+            </div>
+          </section>
+
+          <aside class="panel control-panel">
+            <div class="panel-heading">
+              <div>
+                <p class="section-kicker">CONTROL SEQUENCE</p>
+                <h2>跟随控制</h2>
+              </div>
+              <span id="robotBadge" class="badge badge-muted">DISCONNECTED</span>
+            </div>
+
+            <div id="readOnlyNotice" class="readonly-notice" hidden>
+              另一个浏览器页面正在控制。本页面当前为只读状态。
+            </div>
+
+            <ol class="control-sequence">
+              <li class="control-step">
+                <div class="step-index">1</div>
+                <div class="step-content">
+                  <div class="step-copy">
+                    <strong>基础舵机校准（连接报错时使用）</strong>
+                    <span>按顺序操作：释放六轴扭矩 → 确定中位 → 90 秒采集完整范围 → 自动保存</span>
+                  </div>
+                  <div class="calibration-actions">
+                    <button id="baseCalibrationStartButton" class="button button-danger-outline" type="button" disabled>
+                      ① 释放六轴扭矩
+                    </button>
+                    <button id="baseCalibrationMiddleButton" class="button button-secondary" type="button" disabled>
+                      ② 确定当前六轴中位
+                    </button>
+                    <button id="baseCalibrationRangeStartButton" class="button button-secondary" type="button" disabled>
+                      ③ 开始 90 秒范围采集
+                    </button>
+                    <button id="baseCalibrationFinishButton" class="button button-arm" type="button" disabled>
+                      ④ 提前结束并保存
+                    </button>
+                    <button id="baseCalibrationCancelButton" class="button button-danger-outline" type="button" disabled>
+                      取消本次校准
+                    </button>
+                  </div>
+                  <progress id="baseCalibrationProgressBar" class="progress-track" max="100" value="0"></progress>
+                  <small id="baseCalibrationProgressText" class="progress-label">连接失败并提示 calibration mismatch 时，从这里开始</small>
+                  <small id="baseCalibrationValues" class="progress-label"></small>
+                </div>
+              </li>
+
+              <li class="control-step">
+                <div class="step-index">2</div>
+                <div class="step-content">
+                  <div class="step-copy">
+                    <strong>连接从臂</strong>
+                    <span id="robotIdentity">等待配置…</span>
+                  </div>
+                  <button id="connectButton" class="button button-secondary" type="button" disabled>
+                    连接机器人
+                  </button>
+                  <small id="safeRangeTestNotice" class="progress-label" hidden>
+                    测试模式：跳过固定位置与60秒范围采集；ID1–ID2固定在连接位置，ID3–ID6使用配置安全限制
+                  </small>
+                </div>
+              </li>
+
+              <li id="safeRangeStep" class="control-step" hidden>
+                <div class="step-index">3</div>
+                <div class="step-content">
+                  <div class="step-copy">
+                    <strong>校准固定位置与安全范围</strong>
+                    <span>ID1–ID2 有 10 秒设置固定位置，随后自动开始 ID3–ID6 的 60 秒安全范围采集</span>
+                  </div>
+                  <div class="calibration-actions">
+                    <button id="fixedButton" class="button button-secondary" type="button" disabled>
+                      设置 ID1–ID2 固定位置（10 秒）
+                    </button>
+                    <button id="rangeStartButton" class="button button-secondary" type="button" disabled>
+                      ID3–ID6 将自动采集 60 秒
+                    </button>
+                    <button id="rangeFinishButton" class="button button-arm" type="button" disabled>
+                      已回到中位 · 保存并锁定
+                    </button>
+                    <button id="rangeCancelButton" class="button button-danger-outline" type="button" disabled>
+                      取消并重新锁定
+                    </button>
+                  </div>
+                  <progress
+                    id="rangeProgressBar"
+                    class="progress-track"
+                    max="100"
+                    value="0"
+                    aria-label="安全范围采集时间"
+                  ></progress>
+                  <small id="rangeProgressText" class="progress-label">
+                    未完成 · 这里记录的是归一化位置值，不是角度
+                  </small>
+                </div>
+              </li>
+
+              <li class="control-step">
+                <div id="neutralStepIndex" class="step-index">3</div>
+                <div class="step-content">
+                  <div class="step-copy">
+                    <strong>采集中立姿势</strong>
+                    <span>点击后有 3 秒走到镜头前，再连续采集 30 秒并自动结束</span>
+                  </div>
+                  <button id="neutralButton" class="button button-secondary" type="button" disabled>
+                    3 秒后开始采集
+                  </button>
+                  <progress
+                    id="neutralProgressBar"
+                    class="progress-track"
+                    max="100"
+                    value="0"
+                    aria-label="中立姿势采集进度"
+                  ></progress>
+                  <small id="neutralProgressText" class="progress-label">未采集</small>
+                </div>
+              </li>
+
+              <li class="control-step">
+                <div id="armStepIndex" class="step-index">4</div>
+                <div class="step-content">
+                  <div class="step-copy">
+                    <strong>启动人体跟随</strong>
+                    <span>确认识别稳定并完成中立姿势；点击后有 3 秒到安全位置，可再次点击取消</span>
+                  </div>
+                  <button id="armButton" class="button button-arm" type="button" disabled>
+                    ARM · 3 秒后开始跟随
+                  </button>
+                </div>
+              </li>
+            </ol>
+
+            <button id="stopButton" class="stop-button" type="button" disabled>
+              <span class="stop-symbol" aria-hidden="true"></span>
+              <span>
+                <strong>停止跟随</strong>
+                <small>立即 DISARM · 本动作不主动释放扭矩</small>
+              </span>
+            </button>
+
+            <div class="disconnect-row">
+              <div>
+                <strong>结束操作</strong>
+                <span>先托住机械臂，再释放扭矩</span>
+              </div>
+              <button id="disconnectButton" class="button button-danger-outline" type="button" disabled>
+                断开并释放扭矩
+              </button>
+            </div>
+
+            <dl class="runtime-list">
+              <div><dt>控制租约</dt><dd id="leaseState">—</dd></div>
+              <div><dt>机器人状态</dt><dd id="robotState">—</dd></div>
+              <div><dt>相机 / 模型</dt><dd id="previewState">—</dd></div>
+              <div><dt>相机配置</dt><dd id="cameraConfig">—</dd></div>
+              <div><dt>人体 / 手部映射</dt><dd id="poseSide">—</dd></div>
+            </dl>
+          </aside>
+        </div>
+
+        <section class="panel joints-panel">
+          <div class="panel-heading">
+            <div>
+              <p class="section-kicker">SIX SERVO CHANNELS</p>
+              <h2>六个舵机状态</h2>
+            </div>
+            <div class="legend" aria-label="舵机角色图例">
+              <span><i class="legend-dot fixed"></i>ID1–2 固定</span>
+              <span><i class="legend-dot moving"></i>ID3–6 跟随</span>
+            </div>
+          </div>
+
+          <div class="table-scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">ID</th>
+                  <th scope="col">舵机名称</th>
+                  <th scope="col">角色</th>
+                  <th scope="col">人体映射</th>
+                  <th scope="col">校准时位置</th>
+                  <th scope="col">安全范围 / 固定值</th>
+                  <th scope="col">启动位置</th>
+                  <th scope="col">最近指令</th>
+                </tr>
+              </thead>
+              <tbody id="jointRows">
+                <tr><td colspan="8" class="loading-cell">正在读取六轴状态…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="table-note">
+            位置值不是角度：ID1–ID5 约为 -100～100，ID6 为 0～100。ID1–2 始终保持已确认的固定值；
+            ID3–6 只会在采集并保存的安全范围内独立跟随。范围采集不会改写 LeRobot 舵机 EEPROM 校准。
+          </p>
+        </section>
+      </main>
+
+      <footer>
+        <span>仅限本机访问 · 127.0.0.1</span>
+        <span id="connectionState">等待后台响应</span>
+      </footer>
+    </div>
+  </body>
+</html>
