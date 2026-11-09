@@ -10,6 +10,9 @@ logs/
 safety_profile.json
 .safety_profile.json.*.tmp
 config.json
+agent_preferences.json
+agent_preferences.backup.json
+.agent_preferences.json.*.tmp
 .env
 .git/
 .git-init-partial-backup/

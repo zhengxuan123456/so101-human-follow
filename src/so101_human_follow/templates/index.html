@@ -1,29 +1,38 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-theme="pink">
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <meta name="description" content="SO-101 从臂人体与手部姿态跟随本机控制台">
-    <title>SO-101 人体与手部跟随控制台</title>
+    <meta name="color-scheme" content="light">
+    <meta name="description" content="SO-101 语音 Agent 与人体姿态跟随控制台">
+    <title>SO-101 语音 Agent 控制台</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='agent-theme.css') }}">
     <script src="{{ url_for('static', filename='app.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='agent-ui.js') }}" defer></script>
   </head>
   <body>
     <div class="app-shell">
-      <header class="topbar">
+      <header class="topbar agent-topbar">
         <div class="brand-block">
           <div class="brand-mark" aria-hidden="true">
             <span></span><span></span><span></span>
           </div>
           <div>
-            <p class="eyebrow">LOCAL ROBOT CONTROL</p>
-            <h1>SO-101 人体与手部跟随控制台</h1>
+            <p class="eyebrow">LOCAL ROBOT AGENT</p>
+            <h1>SO-101 语音 Agent 控制台</h1>
           </div>
         </div>
-        <div class="top-status" aria-live="polite">
-          <span id="operatorBadge" class="badge badge-muted">正在获取控制权</span>
-          <span id="armBadge" class="badge badge-safe">DISARMED</span>
+        <div class="header-actions">
+          <div class="theme-switcher" role="group" aria-label="界面主题">
+            <button id="pinkThemeButton" class="theme-button" type="button" data-theme-choice="pink" aria-pressed="true">🎀 可爱粉色</button>
+            <button id="whiteThemeButton" class="theme-button" type="button" data-theme-choice="white" aria-pressed="false">☀️ 简洁白色</button>
+          </div>
+          <button id="openAgentSettingsButton" class="button button-secondary settings-button" type="button">Agent 设置</button>
+          <div class="top-status" aria-live="polite">
+            <span id="operatorBadge" class="badge badge-muted">正在获取控制权</span>
+            <span id="armBadge" class="badge badge-safe">DISARMED</span>
+          </div>
         </div>
       </header>
 
@@ -33,7 +42,7 @@
           <div>
             <strong>网页停止不是物理急停。</strong>
             运行时请让机械臂实体电源开关保持触手可及；断开会释放扭矩，机械臂可能下坠。
-            必须先在预览中分别确认各控制通道识别稳定，再连接和 ARM；ID5 转动时还要留意摄像头线缆。
+            Agent 只能调用允许的动作；关节限位、模型或连接异常时会拒绝运动。视觉检查仅用于视频跟随。
           </div>
         </section>
 
@@ -41,8 +50,38 @@
           正在连接本机控制服务…
         </div>
 
-        <div class="dashboard-grid">
-          <section class="panel camera-panel">
+        <section class="mode-entry-grid" aria-label="选择控制方式">
+          <button id="openVideoFollowButton" class="mode-entry-card video-entry-card" type="button">
+            <span class="mode-entry-icon" aria-hidden="true">◉</span>
+            <span class="mode-entry-copy">
+              <small>CAMERA · POSE + HAND</small>
+              <strong>视频跟随</strong>
+              <span>先在首页连接从臂，再打开实时画面完成“中立姿势 → ARM”</span>
+            </span>
+            <span class="mode-entry-arrow" aria-hidden="true">→</span>
+          </button>
+          <button id="openAgentChatButton" class="mode-entry-card agent-entry-card" type="button">
+            <span class="mode-entry-icon" aria-hidden="true">♡</span>
+            <span class="mode-entry-copy">
+              <small>VOICE · FUNCTION CALLING</small>
+              <strong><span class="agent-entry-name">小助手</span>对话</strong>
+              <span>文字或持续语音交流，让 Agent 编排安全动作</span>
+            </span>
+            <span class="mode-entry-arrow" aria-hidden="true">→</span>
+          </button>
+        </section>
+
+        <div class="dashboard-grid agent-dashboard-grid home-control-layout">
+          <dialog id="videoFollowDialog" class="mode-dialog" aria-labelledby="videoFollowDialogTitle">
+            <div class="mode-dialog-shell">
+              <header class="mode-dialog-header">
+                <div>
+                  <p class="section-kicker">VIDEO FOLLOW</p>
+                  <h2 id="videoFollowDialogTitle">视频跟随</h2>
+                </div>
+                <button id="closeVideoFollowButton" class="dialog-close" type="button" aria-label="关闭视频跟随">×</button>
+              </header>
+              <section class="panel camera-panel">
             <div class="panel-heading">
               <div>
                 <p class="section-kicker">CAMERA · POSE + HAND</p>
@@ -82,13 +121,99 @@
                 <strong id="sendAge">—</strong>
               </article>
             </div>
-          </section>
+              </section>
+              <section class="panel video-follow-control-panel" aria-labelledby="videoFollowControlTitle">
+                <div class="panel-heading">
+                  <div>
+                    <p class="section-kicker">HUMAN FOLLOW ONLY</p>
+                    <h2 id="videoFollowControlTitle">人体视觉跟随流程</h2>
+                  </div>
+                  <span class="mode-pill vision-mode-pill">需中立姿势</span>
+                </div>
+                <p class="video-follow-hint">请先在首页连接从臂；已连接可直接从“采集中立姿势”开始。</p>
+                <ol id="videoFollowSteps" class="control-sequence video-follow-steps"></ol>
+                <div id="videoStopSlot">
+                  <button id="videoDialogStopButton" class="stop-button" type="button" disabled>
+                    <span class="stop-symbol" aria-hidden="true"></span>
+                    <span>
+                      <strong>立即停止机械臂动作</strong>
+                      <small>与首页急停按钮同步 · 停止人体跟随或 Agent 动作</small>
+                    </span>
+                  </button>
+                </div>
+              </section>
+            </div>
+          </dialog>
+
+          <dialog id="agentChatDialog" class="mode-dialog agent-mode-dialog" aria-labelledby="agentPanelTitle">
+            <div class="mode-dialog-shell">
+              <header class="mode-dialog-header">
+                <div>
+                  <p class="section-kicker">VOICE AGENT</p>
+                  <h2>小助手对话</h2>
+                </div>
+                <button id="closeAgentChatButton" class="dialog-close" type="button" aria-label="关闭小助手对话">×</button>
+              </header>
+              <section class="panel agent-panel" aria-labelledby="agentPanelTitle">
+            <div class="panel-heading agent-heading">
+              <div class="agent-identity">
+                <div id="agentAvatar" class="agent-avatar" aria-hidden="true">♡</div>
+                <div>
+                  <p class="section-kicker">VOICE · FUNCTION CALLING</p>
+                  <h2 id="agentPanelTitle"><span id="agentDisplayName">小助手</span> 的对话</h2>
+                </div>
+              </div>
+              <span id="agentStatusBadge" class="badge badge-muted">未配置</span>
+            </div>
+
+            <div id="agentSetupNotice" class="agent-setup-notice">
+              <strong>先完成 Agent 设置</strong>
+              <span>填写云端模型地址、模型名称和 API Key 后，即可文字或语音对话。</span>
+              <button id="noticeSettingsButton" class="link-button" type="button">打开设置</button>
+            </div>
+
+            <p class="voice-state-text">对话动作无需摄像头；普通回应完成后回到动作前的位置。停止后不自动回位。</p>
+
+            <div id="agentChatMessages" class="chat-messages" role="log" aria-live="polite" aria-label="Agent 对话记录">
+              <article class="chat-message assistant-message">
+                <div class="message-avatar" aria-hidden="true">♡</div>
+                <div class="message-bubble">
+                  <strong class="chat-speaker">小助手</strong>
+                  <p>你好呀！设置好云端模型后，可以点“开始语音 Agent”和我说话。</p>
+                </div>
+              </article>
+            </div>
+
+            <div class="speech-transcript" aria-live="polite">
+              <div><span>听到的原话</span><strong id="rawTranscript">—</strong></div>
+              <div><span>规范化指令</span><strong id="normalizedTranscript">—</strong></div>
+            </div>
+
+            <form id="agentMessageForm" class="agent-message-form">
+              <label class="sr-only" for="agentTextInput">输入对话内容</label>
+              <input id="agentTextInput" type="text" maxlength="500" autocomplete="off" placeholder="输入一句话，例如：你好，或者摸摸头">
+              <button id="sendAgentMessageButton" class="button button-agent" type="submit">发送</button>
+            </form>
+
+            <div class="voice-controls">
+              <button id="voiceToggleButton" class="voice-toggle-button" type="button" aria-pressed="false">
+                <span class="voice-icon" aria-hidden="true">🎙</span>
+                <span><strong>开始语音 Agent</strong><small>开启后持续监听，直到手动关闭</small></span>
+              </button>
+              <button id="cancelAgentButton" class="button button-danger-outline" type="button" disabled>取消当前交互</button>
+            </div>
+            <p id="voiceStateText" class="voice-state-text">语音 Agent 未开启</p>
+            <p id="speechPlaybackMessage" class="voice-state-text" role="status" aria-live="polite"></p>
+            <button id="replaySpeechButton" class="button button-secondary" type="button" hidden>点击播放语音</button>
+              </section>
+            </div>
+          </dialog>
 
           <aside class="panel control-panel">
             <div class="panel-heading">
               <div>
                 <p class="section-kicker">CONTROL SEQUENCE</p>
-                <h2>跟随控制</h2>
+                <h2>机器人与跟随控制</h2>
               </div>
               <span id="robotBadge" class="badge badge-muted">DISCONNECTED</span>
             </div>
@@ -97,43 +222,27 @@
               另一个浏览器页面正在控制。本页面当前为只读状态。
             </div>
 
-            <ol class="control-sequence">
+            <div class="control-mode-guide" aria-label="两种控制方式说明">
+              <div>
+                <span class="mode-pill agent-mode-pill">Agent 对话动作</span>
+                <strong>连接从臂后即可使用</strong>
+                <small>无需摄像头、采集中立姿势或启动人体跟随；普通回应完成后自动回位。</small>
+              </div>
+              <div>
+                <span class="mode-pill vision-mode-pill">人体视觉跟随</span>
+                <strong>需要完成下面三个步骤</strong>
+                <small>连接从臂 → 采集中立姿势 → ARM 启动跟随。</small>
+              </div>
+            </div>
+
+            <ol class="control-sequence daily-sequence">
               <li class="control-step">
                 <div class="step-index">1</div>
                 <div class="step-content">
                   <div class="step-copy">
-                    <strong>基础舵机校准（连接报错时使用）</strong>
-                    <span>按顺序操作：释放六轴扭矩 → 确定中位 → 90 秒采集完整范围 → 自动保存</span>
-                  </div>
-                  <div class="calibration-actions">
-                    <button id="baseCalibrationStartButton" class="button button-danger-outline" type="button" disabled>
-                      ① 释放六轴扭矩
-                    </button>
-                    <button id="baseCalibrationMiddleButton" class="button button-secondary" type="button" disabled>
-                      ② 确定当前六轴中位
-                    </button>
-                    <button id="baseCalibrationRangeStartButton" class="button button-secondary" type="button" disabled>
-                      ③ 开始 90 秒范围采集
-                    </button>
-                    <button id="baseCalibrationFinishButton" class="button button-arm" type="button" disabled>
-                      ④ 提前结束并保存
-                    </button>
-                    <button id="baseCalibrationCancelButton" class="button button-danger-outline" type="button" disabled>
-                      取消本次校准
-                    </button>
-                  </div>
-                  <progress id="baseCalibrationProgressBar" class="progress-track" max="100" value="0"></progress>
-                  <small id="baseCalibrationProgressText" class="progress-label">连接失败并提示 calibration mismatch 时，从这里开始</small>
-                  <small id="baseCalibrationValues" class="progress-label"></small>
-                </div>
-              </li>
-
-              <li class="control-step">
-                <div class="step-index">2</div>
-                <div class="step-content">
-                  <div class="step-copy">
                     <strong>连接从臂</strong>
                     <span id="robotIdentity">等待配置…</span>
+                    <span class="path-note">连接成功后，Agent 对话动作立即可用；下面的中立姿势仅用于人体视觉跟随。</span>
                   </div>
                   <button id="connectButton" class="button button-secondary" type="button" disabled>
                     连接机器人
@@ -144,7 +253,7 @@
                 </div>
               </li>
 
-              <li id="safeRangeStep" class="control-step" hidden>
+              <li id="safeRangeStep" class="control-step legacy-safe-range-control" hidden aria-hidden="true" inert>
                 <div class="step-index">3</div>
                 <div class="step-content">
                   <div class="step-copy">
@@ -178,12 +287,12 @@
                 </div>
               </li>
 
-              <li class="control-step">
-                <div id="neutralStepIndex" class="step-index">3</div>
+              <li class="control-step visual-follow-step">
+                <div id="neutralStepIndex" class="step-index">1</div>
                 <div class="step-content">
                   <div class="step-copy">
-                    <strong>采集中立姿势</strong>
-                    <span>点击后有 3 秒走到镜头前，再连续采集 30 秒并自动结束</span>
+                    <strong>仅人体视觉跟随 · 采集中立姿势</strong>
+                    <span>Agent 对话动作不需要此步骤。人体跟随时，点击后有 3 秒走到镜头前，再连续采集 30 秒。</span>
                   </div>
                   <button id="neutralButton" class="button button-secondary" type="button" disabled>
                     3 秒后开始采集
@@ -199,12 +308,12 @@
                 </div>
               </li>
 
-              <li class="control-step">
-                <div id="armStepIndex" class="step-index">4</div>
+              <li class="control-step visual-follow-step">
+                <div id="armStepIndex" class="step-index">2</div>
                 <div class="step-content">
                   <div class="step-copy">
-                    <strong>启动人体跟随</strong>
-                    <span>确认识别稳定并完成中立姿势；点击后有 3 秒到安全位置，可再次点击取消</span>
+                    <strong>仅人体视觉跟随 · ARM</strong>
+                    <span>确认识别稳定并完成中立姿势后启动。Agent 对话动作不需要点击此按钮。</span>
                   </div>
                   <button id="armButton" class="button button-arm" type="button" disabled>
                     ARM · 3 秒后开始跟随
@@ -216,32 +325,82 @@
             <button id="stopButton" class="stop-button" type="button" disabled>
               <span class="stop-symbol" aria-hidden="true"></span>
               <span>
-                <strong>停止跟随</strong>
-                <small>立即 DISARM · 本动作不主动释放扭矩</small>
+                <strong>立即停止机械臂动作</strong>
+                <small>停止人体跟随或 Agent 动作 · 不主动释放扭矩</small>
               </span>
             </button>
 
-            <div class="disconnect-row">
-              <div>
-                <strong>结束操作</strong>
-                <span>先托住机械臂，再释放扭矩</span>
+            <details class="control-details calibration-troubleshooting-details">
+              <summary>
+                <span>
+                  <strong>连接失败处理（高级）</strong>
+                  <small>仅连接报 calibration mismatch 时使用；正常连接请勿操作</small>
+                </span>
+                <span class="summary-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="calibration-troubleshooting-content">
+                <div class="troubleshooting-warning">
+                  <strong>这不是正常连接步骤</strong>
+                  <span>先点击上方“连接机器人”。只有错误信息明确包含 calibration mismatch，才展开这里重新校准。</span>
+                </div>
+                <div class="step-copy">
+                  <strong>基础舵机校准</strong>
+                  <span>故障处理顺序：释放六轴扭矩 → 确定中位 → 90 秒采集完整范围 → 自动保存。</span>
+                </div>
+                <div class="calibration-actions">
+                  <button id="baseCalibrationStartButton" class="button button-danger-outline" type="button" disabled>
+                    释放六轴扭矩
+                  </button>
+                  <button id="baseCalibrationMiddleButton" class="button button-secondary" type="button" disabled>
+                    确定当前六轴中位
+                  </button>
+                  <button id="baseCalibrationRangeStartButton" class="button button-secondary" type="button" disabled>
+                    开始 90 秒范围采集
+                  </button>
+                  <button id="baseCalibrationFinishButton" class="button button-arm" type="button" disabled>
+                    提前结束并保存
+                  </button>
+                  <button id="baseCalibrationCancelButton" class="button button-danger-outline" type="button" disabled>
+                    取消本次校准
+                  </button>
+                </div>
+                <progress id="baseCalibrationProgressBar" class="progress-track" max="100" value="0"></progress>
+                <small id="baseCalibrationProgressText" class="progress-label">仅在连接失败并提示 calibration mismatch 时使用</small>
+                <small id="baseCalibrationValues" class="progress-label"></small>
               </div>
-              <button id="disconnectButton" class="button button-danger-outline" type="button" disabled>
-                断开并释放扭矩
-              </button>
-            </div>
+            </details>
 
-            <dl class="runtime-list">
-              <div><dt>控制租约</dt><dd id="leaseState">—</dd></div>
-              <div><dt>机器人状态</dt><dd id="robotState">—</dd></div>
-              <div><dt>相机 / 模型</dt><dd id="previewState">—</dd></div>
-              <div><dt>相机配置</dt><dd id="cameraConfig">—</dd></div>
-              <div><dt>人体 / 手部映射</dt><dd id="poseSide">—</dd></div>
-            </dl>
+            <details class="control-details diagnostic-details">
+              <summary>
+                <span><strong>连接诊断与结束操作</strong><small>查看运行状态，或断开并释放扭矩</small></span>
+                <span class="summary-chevron" aria-hidden="true">⌄</span>
+              </summary>
+              <div class="diagnostic-content">
+                <dl class="runtime-list">
+                  <div><dt>控制租约</dt><dd id="leaseState">—</dd></div>
+                  <div><dt>机器人状态</dt><dd id="robotState">—</dd></div>
+                  <div><dt>相机 / 模型</dt><dd id="previewState">—</dd></div>
+                  <div><dt>相机配置</dt><dd id="cameraConfig">—</dd></div>
+                  <div><dt>人体 / 手部映射</dt><dd id="poseSide">—</dd></div>
+                </dl>
+                <div class="disconnect-row">
+                  <div>
+                    <strong>结束操作</strong>
+                    <span>先托住机械臂，再释放扭矩</span>
+                  </div>
+                  <button id="disconnectButton" class="button button-danger-outline" type="button" disabled>断开并释放扭矩</button>
+                </div>
+              </div>
+            </details>
           </aside>
         </div>
 
-        <section class="panel joints-panel">
+        <details class="panel advanced-panel">
+          <summary>
+            <span><strong>六个舵机状态</strong><small>查看映射、校准值、安全范围和最近指令</small></span>
+            <span class="summary-chevron" aria-hidden="true">⌄</span>
+          </summary>
+          <section class="joints-panel">
           <div class="panel-heading">
             <div>
               <p class="section-kicker">SIX SERVO CHANNELS</p>
@@ -276,7 +435,8 @@
             位置值不是角度：ID1–ID5 约为 -100～100，ID6 为 0～100。ID1–2 始终保持已确认的固定值；
             ID3–6 只会在采集并保存的安全范围内独立跟随。范围采集不会改写 LeRobot 舵机 EEPROM 校准。
           </p>
-        </section>
+          </section>
+        </details>
       </main>
 
       <footer>
@@ -284,5 +444,69 @@
         <span id="connectionState">等待后台响应</span>
       </footer>
     </div>
+
+    <dialog id="agentSettingsDialog" class="agent-settings-dialog" aria-labelledby="agentSettingsTitle">
+      <form id="agentSettingsForm" class="agent-settings-form">
+        <div class="dialog-heading">
+          <div>
+            <p class="section-kicker">AGENT SETTINGS</p>
+            <h2 id="agentSettingsTitle">设置你的语音 Agent</h2>
+          </div>
+          <button id="closeAgentSettingsButton" class="dialog-close" type="button" aria-label="关闭设置">×</button>
+        </div>
+
+        <div class="form-grid">
+          <label class="form-field">
+            <span>Agent 名字</span>
+            <input id="agentNameInput" name="agent_name" type="text" maxlength="24" autocomplete="off" placeholder="例如：小白" required>
+            <small>机器人会在语音回复中使用这个名字。</small>
+          </label>
+          <label class="form-field form-field-wide">
+            <span>API 地址 Base URL</span>
+            <input id="agentBaseUrlInput" name="base_url" type="url" maxlength="300" autocomplete="url" placeholder="https://api.example.com/v1" required>
+          </label>
+          <label class="form-field form-field-wide">
+            <span>API Key</span>
+            <div class="password-field">
+              <input id="agentApiKeyInput" name="api_key" type="password" maxlength="500" autocomplete="new-password" placeholder="留空表示保持当前 Key">
+              <button id="toggleApiKeyButton" class="password-toggle" type="button" aria-label="显示或隐藏 API Key">显示</button>
+            </div>
+            <small>Key 默认只保存在本机进程内存中，不写入日志和项目配置。</small>
+          </label>
+          <label class="form-field">
+            <span>模型名称</span>
+            <input id="agentModelInput" name="model" type="text" maxlength="120" autocomplete="off" placeholder="支持 Function Calling 的模型" required>
+          </label>
+          <label class="form-field">
+            <span>语音</span>
+            <select id="agentVoiceSelect" name="voice">
+              <option value="taiwan_female">台妹女声 · 台湾晓臻</option>
+              <option value="puppy_male">小奶狗男声 · 年轻清朗云希</option>
+              <option value="system_auto">本机中文语音（离线）</option>
+            </select>
+          </label>
+          <div class="form-field form-field-wide">
+            <button id="previewAgentVoiceButton" class="button button-secondary" type="button">试听所选音色</button>
+            <small>两款自然音色需要联网；试听只播放声音，不会让机械臂动作。男声为年轻清朗风格，实际效果以试听为准。</small>
+          </div>
+        </div>
+
+        <div class="fixed-prompt-notice">
+          <span aria-hidden="true">🛡️</span>
+          <div>
+            <strong>内置安全提示词与严格 JSON 已启用</strong>
+            <small>提示词不可修改；Agent 只能调用白名单动作，所有参数仍需通过本地安全检查。</small>
+          </div>
+        </div>
+        <p id="agentSettingsMessage" class="settings-message" role="status" aria-live="polite"></p>
+
+        <div class="dialog-actions">
+          <button id="testAgentConnectionButton" class="button button-secondary" type="button">测试连接</button>
+          <span class="dialog-action-spacer"></span>
+          <button id="cancelAgentSettingsButton" class="button button-danger-outline" type="button">取消</button>
+          <button id="saveAgentSettingsButton" class="button button-agent" type="submit">保存设置</button>
+        </div>
+      </form>
+    </dialog>
   </body>
 </html>

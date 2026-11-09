@@ -94,7 +94,10 @@ class SO101RobotAdapter:
             if actual is None:
                 differences.append(f"{motor}: missing from EEPROM readback")
                 continue
-            for field in ("homing_offset", "range_min", "range_max"):
+            # LeRobot's calibrated-state check also depends on drive direction.
+            # Include it in diagnostics so a drive-mode-only mismatch is actionable
+            # instead of being reported as an unreadable generic mismatch.
+            for field in ("drive_mode", "homing_offset", "range_min", "range_max"):
                 saved_value = int(getattr(saved, field))
                 actual_value = int(getattr(actual, field))
                 if saved_value != actual_value:
@@ -287,6 +290,34 @@ class SO101RobotAdapter:
             raise RuntimeError("Motion commands are disabled during manual joint positioning.")
         return self.robot.send_action(action)
 
+    def send_observed(
+        self, action: dict[str, float]
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """Read once, apply LeRobot's unchanged cap, then send an Agent goal.
+
+        The measured positions precede this write; they confirm an earlier goal
+        rather than pretending that a freshly sent goal has already been reached.
+        Reusing that read avoids two serial round trips on each Agent tick.
+        """
+        if not self.connected or self.robot is None:
+            raise RuntimeError("Robot is not connected.")
+        if self.manual_range_active or self.fixed_positioning_active:
+            raise RuntimeError("Motion commands are disabled during manual joint positioning.")
+        if set(action) != set(ALL_JOINTS):
+            raise ValueError("Agent action must contain all six joints.")
+        goals = {joint.removesuffix(".pos"): float(action[joint]) for joint in ALL_JOINTS}
+        if not all(math.isfinite(value) for value in goals.values()):
+            raise ValueError("Agent action contains a non-finite target.")
+        observed = self.read_positions()
+        from lerobot.robots.utils import ensure_safe_goal_position
+
+        goals = ensure_safe_goal_position(
+            {motor: (value, observed[f"{motor}.pos"]) for motor, value in goals.items()},
+            self.settings.max_relative_target,
+        )
+        self.robot.bus.sync_write("Goal_Position", goals)
+        return {f"{motor}.pos": value for motor, value in goals.items()}, observed
+
     def disconnect(self) -> None:
         try:
             self._cleanup_partial_connection()
@@ -294,6 +325,49 @@ class SO101RobotAdapter:
             self.manual_range_active = False
             self.fixed_positioning_active = False
             self._fixed_positioning_motors = ()
+
+    def send_agent_targets(
+        self, action: dict[str, float], active_joints: tuple[str, ...],
+        fixed_positions: dict[str, float],
+    ) -> tuple[dict[str, float], dict[str, float]]:
+        """Write only this step's moving axes and the two fixed-base holds."""
+        if not self.connected or self.robot is None:
+            raise RuntimeError("Robot is not connected.")
+        if self.manual_range_active or self.fixed_positioning_active:
+            raise RuntimeError("Motion commands are disabled during manual joint positioning.")
+        selected = set(active_joints) | set(fixed_positions)
+        if not selected <= set(ALL_JOINTS):
+            raise ValueError("Agent requested an unknown joint.")
+        observed = self.read_positions()
+        goals = {
+            joint.removesuffix(".pos"): float(fixed_positions.get(joint, action[joint]))
+            for joint in selected
+        }
+        if not all(math.isfinite(value) for value in goals.values()):
+            raise ValueError("Agent requested a non-finite target.")
+        from lerobot.robots.utils import ensure_safe_goal_position
+        caps = self.settings.max_relative_target
+        if isinstance(caps, dict):
+            caps = {motor: caps[motor] for motor in goals}
+        goals = ensure_safe_goal_position(
+            {motor: (goal, observed[f"{motor}.pos"]) for motor, goal in goals.items()}, caps,
+        )
+        self.robot.bus.sync_write("Goal_Position", goals)
+        sent = dict(observed)
+        sent.update({f"{motor}.pos": goal for motor, goal in goals.items()})
+        return sent, observed
+
+    def hold_current(self) -> dict[str, float]:
+        """Replace an interrupted goal with encoder positions, without torque changes."""
+        if not self.connected or self.robot is None:
+            raise RuntimeError("Robot is not connected.")
+        if self.manual_range_active or self.fixed_positioning_active:
+            raise RuntimeError("Cannot seed a powered hold during manual positioning.")
+        observed = self.read_positions()
+        self.robot.bus.sync_write(
+            "Goal_Position", {joint.removesuffix(".pos"): value for joint, value in observed.items()}
+        )
+        return observed
 
 
 class SO101CalibrationSession:

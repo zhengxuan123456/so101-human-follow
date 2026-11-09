@@ -3,7 +3,10 @@ import time
 import unittest
 from dataclasses import replace
 from types import SimpleNamespace
+from unittest.mock import patch
 
+from so101_human_follow.agent_schema import AgentAction, InteractionPlan
+from so101_human_follow.agent_service import AgentService
 from so101_human_follow.config import load_config
 from so101_human_follow.pose_math import PoseFeatures
 from so101_human_follow.pose_detector import PoseDetection
@@ -132,9 +135,16 @@ class WebApiTest(unittest.TestCase):
 
     def test_stop_is_immediate_and_does_not_release_torque(self):
         self.client.get("/api/status", headers=self.headers)
+        cancelled = []
+        agent_service = self.app.extensions["so101_agent_service"]
+        agent_service.cancel_all = lambda reason: cancelled.append(reason) or []
         response = self.client.post("/api/disarm", headers=self.headers)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(self.engine.disarms, ["operator pressed stop-following"])
+        self.assertEqual(cancelled, ["operator pressed stop-following"])
+        self.assertEqual(
+            self.engine.disarms,
+            ["operator pressed stop-following", "operator pressed stop-following"],
+        )
         self.assertEqual(self.engine.submissions, [])
         self.assertIn("did not request torque release", response.get_json()["message"])
 
@@ -175,6 +185,30 @@ class WebApiTest(unittest.TestCase):
 
 
 class WebEngineSnapshotTest(unittest.TestCase):
+    def _arm_ready_engine(self):
+        config = load_config("config.json")
+        engine = ControlEngine(config, robot_allowed=True)
+        client_id = "client_arm_ready_123456"
+        engine.heartbeat(client_id)
+        features = PoseFeatures(0.0, 0.0, 0.5, 0.5)
+        robot = SimpleNamespace(connected=True, send_calls=0)
+        engine._robot = robot
+        engine._robot_state = "CONNECTED_DISARMED"
+        engine._safe_profile = SimpleNamespace(
+            controlled_limits={
+                joint: tuple(config.safety.absolute_limits[joint])
+                for joint in config.mapping.controlled_joints
+            },
+            fixed_positions={
+                joint: 0.0 for joint in config.mapping.fixed_joints.names
+            },
+        )
+        engine._neutral = features
+        engine._latest_features = features
+        engine._last_pose_time = time.monotonic()
+        engine._valid_streak = config.safety.valid_frames_before_arm
+        return engine, client_id, robot
+
     def test_snapshot_marks_lower_two_fixed_and_upper_four_moving(self):
         config = load_config("config.json")
         engine = ControlEngine(config, robot_allowed=True)
@@ -330,6 +364,88 @@ class WebEngineSnapshotTest(unittest.TestCase):
             engine._execute_command(command)
         self.assertFalse(engine._armed)
 
+    def test_arm_is_hidden_and_rejected_during_agent_motion(self):
+        engine, client_id, _ = self._arm_ready_engine()
+        plan = SimpleNamespace(name="test Agent motion", keyframes=(object(),))
+        engine._agent_plan = plan
+
+        self.assertFalse(engine.status(client_id)["can_arm"])
+        with self.assertRaisesRegex(ControlError, "active Agent motion"):
+            engine._arm("123", client_id=client_id, submitted_epoch=engine._epoch)
+
+        self.assertFalse(engine._armed)
+        self.assertIs(engine._agent_plan, plan)
+
+    def test_arm_is_hidden_and_rejected_while_torque_release_is_pending(self):
+        engine, client_id, _ = self._arm_ready_engine()
+        engine._release_pending = True
+
+        self.assertFalse(engine.status(client_id)["can_arm"])
+        with self.assertRaisesRegex(ControlError, "Torque release"):
+            engine._arm("123", client_id=client_id, submitted_epoch=engine._epoch)
+
+        self.assertFalse(engine._armed)
+
+    def test_agent_motion_fails_closed_when_visual_proximity_is_unusable(self):
+        cases = (
+            ("UNKNOWN", time.monotonic(), "visual proximity UNKNOWN"),
+            ("TOO_CLOSE", time.monotonic(), "visual proximity TOO_CLOSE"),
+            (
+                "SAFE",
+                time.monotonic() - load_config("config.json").safety.tracking_timeout_s - 1.0,
+                "visual proximity is stale",
+            ),
+        )
+        for state, observed_at, expected_error in cases:
+            with self.subTest(state=state, observed_at=observed_at):
+                engine, client_id, robot = self._arm_ready_engine()
+                robot.send = lambda action: self.fail("Agent must not send without fresh proximity")
+                engine._agent_plan = SimpleNamespace(name="test Agent motion")
+                engine._agent_plan_client = client_id
+                engine._agent_plan_epoch = engine._epoch
+                engine._agent_motion_state = "RUNNING"
+                engine._visual_proximity = SimpleNamespace(
+                    state=state,
+                    reason="no reliable visual scale",
+                )
+                engine._visual_proximity_time = observed_at
+
+                engine._send_agent_if_due(time.monotonic(), 0.0)
+
+                self.assertIsNone(engine._agent_plan)
+                self.assertTrue(engine._motion_stop.is_set())
+                self.assertIn(expected_error, engine._agent_motion_error)
+
+    def test_connect_is_rejected_while_base_calibration_is_active(self):
+        config = load_config("config.json")
+        engine = ControlEngine(config, robot_allowed=True)
+        client_id = "client_calibration_123456"
+        engine.heartbeat(client_id)
+        engine._preview_state = "RUNNING"
+        engine._base_calibration = object()
+        engine._base_calibration_state = "WAITING_MIDDLE"
+
+        with self.assertRaisesRegex(ControlError, "base calibration"):
+            engine._connect_robot("123", client_id=client_id)
+
+        self.assertIsNone(engine._robot)
+        self.assertEqual(engine._base_calibration_state, "WAITING_MIDDLE")
+
+    def test_neutral_request_is_rejected_without_cancelling_agent_motion(self):
+        config = load_config("config.json")
+        engine = ControlEngine(config, robot_allowed=True)
+        plan = SimpleNamespace(name="test Agent motion")
+        engine._agent_plan = plan
+        engine._agent_motion_state = "RUNNING"
+        epoch = engine._epoch
+
+        with self.assertRaisesRegex(ControlError, "active Agent motion"):
+            engine._start_neutral_collection()
+
+        self.assertIs(engine._agent_plan, plan)
+        self.assertEqual(engine._agent_motion_state, "RUNNING")
+        self.assertEqual(engine._epoch, epoch)
+
     def test_stop_refuses_to_promise_hold_when_release_is_pending(self):
         config = load_config("config.json")
         engine = ControlEngine(config, robot_allowed=True)
@@ -470,6 +586,58 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertFalse(engine._armed)
         engine._send_if_due(features, time.monotonic() + 1.0, 0.0)
         self.assertEqual(robot.send_count, 1)
+
+
+class AgentStopRaceTest(unittest.TestCase):
+    def test_stop_invalidates_cloud_result_before_local_dispatch(self):
+        model_started = threading.Event()
+        model_release = threading.Event()
+        dispatched = []
+
+        plan = InteractionPlan(
+            version="1.0",
+            reply="好呀",
+            actions=(AgentAction("open_gripper", {"speed": "slow"}),),
+            requires_confirmation=False,
+        )
+
+        class SlowClient:
+            def __init__(self, _settings):
+                pass
+
+            def request_plan(self, **_kwargs):
+                model_started.set()
+                if not model_release.wait(2.0):
+                    raise TimeoutError("test model was not released")
+                return plan
+
+        service = AgentService(
+            plan_callback=lambda value, context: dispatched.append((value, context)),
+            stop_callback=lambda _reason: None,
+        )
+        service.configure(
+            agent_name="小助手",
+            base_url="https://example.com/v1",
+            model="test-model",
+            api_key="test-key",
+        )
+        try:
+            with patch(
+                "so101_human_follow.agent_service.OpenAICompatibleClient",
+                SlowClient,
+            ):
+                queued = service.submit_text("张开夹爪", context={"client_id": "test"})
+                self.assertTrue(model_started.wait(1.0))
+                cancelled = service.cancel_all("operator pressed stop-following")
+                self.assertEqual(cancelled, [queued["task_id"]])
+                model_release.set()
+                service._queue.join()
+
+            self.assertEqual(service.get_task(queued["task_id"])["state"], "CANCELLED")
+            self.assertEqual(dispatched, [])
+        finally:
+            model_release.set()
+            service.shutdown()
 
 
 if __name__ == "__main__":

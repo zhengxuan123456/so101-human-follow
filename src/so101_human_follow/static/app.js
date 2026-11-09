@@ -8,7 +8,7 @@
   const CONTROL_CONFIRMATION_CODE = "123";
   const clientId = getClientId();
   let currentState = null;
-  let polling = false;
+  let pollingPromise = null;
   let busy = false;
   let pendingCommand = null;
   let videoFailed = false;
@@ -139,6 +139,7 @@
       state.robot_state === "CONNECTED_DISARMED" &&
       state.preview_state === "RUNNING" &&
       !state.armed &&
+      !state.agent_motion?.active &&
       !state.neutral_collecting &&
       !state.release_pending &&
       (!state.robot_allowed || state.safe_range?.profile_ready) &&
@@ -153,6 +154,7 @@
       state.preview_state === "RUNNING" &&
       state.neutral_ready &&
       !state.armed &&
+      !state.agent_motion?.active &&
       !state.neutral_collecting &&
       !state.release_pending &&
       !state.error
@@ -166,6 +168,7 @@
     const operator = Boolean(state.operator);
     const poseValid = Boolean(state.pose_valid);
     const safeRange = state.safe_range || {};
+    const agentMotionActive = Boolean(state.agent_motion?.active);
     const safeRangeSkipped = Boolean(
       safeRange.skipped || safeRange.test_mode || state.skip_safe_range_calibration,
     );
@@ -181,8 +184,8 @@
     // expose this obsolete step to the operator.
     elements.safeRangeStep.hidden = true;
     elements.safeRangeTestNotice.hidden = !safeRangeSkipped;
-    elements.neutralStepIndex.textContent = "3";
-    elements.armStepIndex.textContent = "4";
+    elements.neutralStepIndex.textContent = "1";
+    elements.armStepIndex.textContent = "2";
     let countdownCancelled = false;
     if (neutralCountdownTimer !== null && !canScheduleNeutral) {
       cancelNeutralCountdown(false);
@@ -447,10 +450,14 @@
     // STOP remains available for an in-flight ARM, but not after torque release has
     // been confirmed: a release already in progress cannot be cancelled safely.
     elements.stopButton.disabled =
-      !operator || releaseInProgress || (!state.armed && !armPending);
+      !operator || releaseInProgress || (!state.armed && !armPending && !agentMotionActive);
     elements.disconnectButton.disabled =
       busy || countdownActive || !operator || !state.can_disconnect;
-    elements.connectButton.textContent = robotState === "CONNECTING" ? "连接中…" : "连接机器人";
+    elements.connectButton.textContent = robotState === "CONNECTING"
+      ? "连接中…"
+      : state.robot_connected
+        ? robotState === "FAULT" ? "已连接 · 需处理故障" : "已连接从臂"
+        : "连接机器人";
     elements.fixedButton.textContent = fixedPositioning
       ? `正在设置 ID1–ID2 · ${Math.ceil(Number(safeRange.remaining_s) || 0)} 秒`
       : safeRange.fixed_ready
@@ -613,9 +620,12 @@
     return payload;
   }
 
-  async function pollStatus() {
-    if (polling) return;
-    polling = true;
+  async function pollStatus(forceFresh = false) {
+    if (pollingPromise) {
+      await pollingPromise;
+      if (!forceFresh) return;
+    }
+    const request = (async () => {
     try {
       const state = await api("/api/status");
       render(state);
@@ -626,8 +636,13 @@
       elements.globalMessage.textContent = `无法读取后台状态：${error.message}`;
       elements.globalMessage.classList.add("is-error");
       disableAllControls();
+    }
+    })();
+    pollingPromise = request;
+    try {
+      await request;
     } finally {
-      polling = false;
+      if (pollingPromise === request) pollingPromise = null;
     }
   }
 
@@ -642,7 +657,7 @@
       if (body !== null) options.body = JSON.stringify(body);
       const result = await api(path, options);
       elements.globalMessage.textContent = result.message || "命令已执行";
-      await pollStatus();
+      await pollStatus(true);
     } catch (error) {
       commandError = error.message;
     } finally {
@@ -662,7 +677,7 @@
     elements.globalMessage.textContent = "正在停止跟随…";
     try {
       const result = await api("/api/disarm", { method: "POST" });
-      await pollStatus();
+      await pollStatus(true);
       elements.globalMessage.textContent = result.message || "已停止跟随；本次命令未请求释放扭矩";
       elements.globalMessage.classList.remove("is-error", "is-armed");
     } catch (error) {

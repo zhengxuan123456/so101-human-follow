@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import logging
+import math
 import re
 import secrets
 import sys
+import time
 import webbrowser
 from dataclasses import replace
 from logging.handlers import RotatingFileHandler
@@ -16,8 +18,18 @@ from flask import Flask, Response, abort, jsonify, make_response, render_templat
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
+from .agent_schema import InteractionPlan
+from .agent_service import AgentService
 from .config import load_config
-from .web_engine import ControlEngine, ControlError
+from .speech_normalizer import normalize_speech
+from .speech_synthesis import (
+    SpeechBusyError,
+    SpeechSynthesisError,
+    SpeechSynthesizer,
+    SpeechTimeoutError,
+    SpeechUnavailableError,
+)
+from .web_engine import CONTROL_CONFIRMATION_CODE, ControlEngine, ControlError
 
 
 COOKIE_NAME = "so101_control"
@@ -69,16 +81,155 @@ def create_app(
     engine: ControlEngine,
     *,
     control_token: str | None = None,
+    agent_service: AgentService | None = None,
+    preferences_path: Path | None = None,
 ) -> Flask:
     """Create the local-only HTTP layer around a single ControlEngine."""
 
     app = Flask(__name__)
+    speech_synthesizer = SpeechSynthesizer()
+    app.extensions["so101_speech_synthesizer"] = speech_synthesizer
     token = control_token or secrets.token_urlsafe(32)
     app.config.update(
         MAX_CONTENT_LENGTH=4096,
         SO101_CONTROL_TOKEN=token,
         JSON_SORT_KEYS=False,
     )
+
+    def dispatch_agent_plan(plan: InteractionPlan, context: object) -> dict[str, object]:
+        """Translate validated Function Calling actions into existing engine commands.
+
+        The cloud model never receives a joint API.  This adapter is the only bridge
+        from the fixed semantic schema to the existing ControlEngine, which remains
+        the sole owner of the serial bus and all tuned motion/safety parameters.
+        """
+
+        if not isinstance(context, dict):
+            raise ControlError("Agent request lost its local control context.")
+        operator = str(context.get("client_id", ""))
+        if not engine.has_lease(operator):
+            raise ControlError("The browser control lease expired before Agent motion.")
+
+        names = [action.name for action in plan.actions]
+        follow_actions = {"start_human_follow", "stop_human_follow"} & set(names)
+        if follow_actions and len(names) != 1:
+            raise ControlError(
+                "Start/stop following must be a separate Agent action, not mixed with a gesture."
+            )
+        if names == ["stop_human_follow"]:
+            engine.stop_following("Agent requested stop-following")
+            LOGGER.info("agent semantic action dispatched | action=stop_human_follow")
+            return {"ok": True, "message": "Following stopped."}
+        if names == ["start_human_follow"]:
+            LOGGER.info("agent semantic action dispatched | action=start_human_follow")
+            return engine.submit(
+                "arm",
+                {"confirmation": CONTROL_CONFIRMATION_CODE},
+                client_id=operator,
+            )
+
+        motion_actions: list[dict[str, object]] = []
+        for action in plan.actions:
+            arguments = dict(action.arguments)
+            if action.name in {
+                "perform_greeting",
+                "open_gripper",
+                "close_gripper",
+                "enter_pet_pose",
+                "leave_pet_pose",
+                "return_to_neutral",
+                "return_to_action_start",
+                "perform_response_gesture",
+                "wait",
+            }:
+                motion_actions.append({"name": action.name, "arguments": arguments})
+                continue
+            if action.name == "perform_gesture":
+                gesture = str(arguments.get("gesture", ""))
+                count = int(arguments.get("count", 1))
+                intensity = str(arguments.get("intensity", "normal"))
+                amplitude = 0.55 if intensity == "small" else 1.0
+                if gesture == "nod":
+                    motion_actions.append(
+                        {
+                            "name": "nod",
+                            "arguments": {"count": count, "intensity": intensity},
+                        }
+                    )
+                elif gesture == "wave":
+                    motion_actions.append(
+                        {
+                            "name": "wave_wrist",
+                            "arguments": {"count": count, "amplitude": amplitude},
+                        }
+                    )
+                else:
+                    motion_actions.append(
+                        {
+                            "name": "happy_wiggle",
+                            "arguments": {"count": count, "amplitude": amplitude},
+                        }
+                    )
+                continue
+            if action.name == "perform_dance":
+                duration = float(arguments.get("duration_seconds", 5.0))
+                count = max(1, min(3, round(duration / 2.0)))
+                motion_actions.extend(
+                    [
+                        {
+                            "name": "happy_wiggle",
+                            "arguments": {"count": count, "amplitude": 1.0},
+                        },
+                        {
+                            "name": "wave_wrist",
+                            "arguments": {"count": count, "amplitude": 1.0},
+                        },
+                    ]
+                )
+                continue
+            raise ControlError(f"Unsupported local Agent action: {action.name}")
+
+        if len(motion_actions) > 12:
+            raise ControlError("The Agent motion plan is too long; please split the request.")
+        if not motion_actions:
+            return {"ok": True, "message": "Reply only; no robot action requested."}
+        LOGGER.info(
+            "agent semantic plan queued | actions=%s",
+            [item["name"] for item in motion_actions],
+        )
+        return engine.submit(
+            "agent_plan_start",
+            {
+                "actions": motion_actions,
+                "speech_duration_s": context.get("speech_duration_s"),
+            },
+            client_id=operator,
+        )
+
+    def engine_stop(reason: str) -> dict[str, object]:
+        LOGGER.warning("agent stop requested | reason=%s", reason)
+        engine.stop_following(reason)
+        return {"ok": True, "message": f"DISARMED: {reason}"}
+
+    def agent_stop(reason: str) -> dict[str, object]:
+        # Do not let a local Agent dispatch delay the operator's STOP.  The first
+        # stop interrupts anything already queued/running; cancel_all then waits
+        # out (or invalidates) the dispatch boundary; the final stop covers the
+        # narrow case where a dispatch crossed the boundary after the first one.
+        result = engine_stop(reason)
+        try:
+            agent_service.cancel_all(reason)
+        finally:
+            engine_stop(reason)
+        return result
+
+    if agent_service is None:
+        agent_service = AgentService(
+            plan_callback=dispatch_agent_plan,
+            stop_callback=engine_stop,
+            preferences_path=preferences_path,
+        )
+    app.extensions["so101_agent_service"] = agent_service
 
     def client_id() -> str:
         value = request.headers.get("X-Client-Id", "")
@@ -120,11 +271,11 @@ def create_app(
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         response.headers["Cross-Origin-Resource-Policy"] = "same-origin"
         response.headers["Permissions-Policy"] = (
-            "camera=(), microphone=(), geolocation=(), usb=(), serial=()"
+            "camera=(), microphone=(self), geolocation=(), usb=(), serial=()"
         )
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; img-src 'self' data:; script-src 'self'; "
-            "style-src 'self'; connect-src 'self'; object-src 'none'; "
+            "style-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; "
             "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         )
         return response
@@ -323,7 +474,7 @@ def create_app(
     @app.post("/api/stop")
     def disarm_robot():
         require_operator()
-        engine.stop_following("operator pressed stop-following")
+        agent_stop("operator pressed stop-following")
         return jsonify(
             ok=True,
             message="Following stopped. This STOP action did not request torque release.",
@@ -333,6 +484,7 @@ def create_app(
     def disconnect_robot():
         operator = require_operator()
         payload = request.get_json(silent=True) or {}
+        agent_service.cancel_all("robot disconnect requested")
         return jsonify(
             engine.submit(
                 "disconnect",
@@ -340,6 +492,275 @@ def create_app(
                 client_id=operator,
             )
         )
+
+    def wait_for_agent_task(task_id: str, timeout_s: float = 35.0) -> dict[str, object]:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            task = agent_service.get_task(task_id)
+            if task["state"] not in {"QUEUED", "THINKING", "DISPATCHING"}:
+                return task
+            time.sleep(0.05)
+        raise ControlError("The Agent is still processing; check its status before retrying.")
+
+    def agent_task_response(task: dict[str, object]):
+        if task.get("state") == "FAILED":
+            return jsonify(ok=False, error=task.get("error") or "Agent request failed."), 502
+        response = dict(task)
+        response["ok"] = True
+        plan = response.get("plan")
+        if isinstance(plan, dict):
+            response["actions"] = plan.get("actions", [])
+            response["requires_confirmation"] = bool(plan.get("requires_confirmation"))
+        return jsonify(response)
+
+    @app.get("/api/agent/settings")
+    def get_agent_settings():
+        value = client_id()
+        engine.heartbeat(value)
+        return jsonify(ok=True, settings=agent_service.public_settings())
+
+    @app.post("/api/agent/settings")
+    def save_agent_settings():
+        require_operator()
+        payload = request.get_json(silent=True) or {}
+        try:
+            settings = agent_service.configure(
+                agent_name=str(payload.get("agent_name", "")),
+                base_url=str(payload.get("base_url", "")),
+                model=str(payload.get("model", "")),
+                voice=None if "voice" not in payload else str(payload["voice"]),
+                api_key=(
+                    None
+                    if "api_key" not in payload
+                    else str(payload.get("api_key", ""))
+                ),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            abort(400, str(exc))
+        return jsonify(
+            ok=True,
+            settings=settings,
+            message="名称、API 地址、模型和音色已保存；API Key 仅保存在本次后端进程内存中。",
+        )
+
+    @app.post("/api/agent/test-connection")
+    def test_agent_connection():
+        require_operator()
+        payload = request.get_json(silent=True) or {}
+        try:
+            result = agent_service.test_connection(
+                agent_name=str(payload.get("agent_name", "")),
+                base_url=str(payload.get("base_url", "")),
+                model=str(payload.get("model", "")),
+                api_key=(
+                    None
+                    if "api_key" not in payload
+                    else str(payload.get("api_key", ""))
+                ),
+            )
+        except (TypeError, ValueError, RuntimeError) as exc:
+            LOGGER.warning("agent connection test failed | error=%s", exc)
+            return jsonify(ok=False, error=str(exc)), 502
+        return jsonify(
+            ok=True,
+            message="连接成功，模型返回了可验证的 Function Calling 结构。",
+            reply=result["reply"],
+        )
+
+    @app.post("/api/agent/message")
+    def send_agent_message():
+        operator = require_operator()
+        payload = request.get_json(silent=True) or {}
+        text = payload.get("text", "")
+        if not isinstance(text, str):
+            abort(400, "text must be a string.")
+        try:
+            # Speech completion does not imply physical motion completion.
+            # Do not pay for/prepare another gesture while one is returning.
+            # STOP must always bypass this guard.
+            if (
+                engine.status(operator).get("agent_motion", {}).get("active")
+                and not normalize_speech(text).emergency_stop
+            ):
+                LOGGER.info("agent request deferred by active motion | new_request_not_queued=true")
+                abort(409, "上一个机械臂动作仍在执行或回位，请完成后再发送，或先点击停止。")
+            queued = agent_service.submit_text(
+                text,
+                context={
+                    "client_id": operator,
+                    "source": str(payload.get("source", "text")),
+                    "defer_motion": payload.get("defer_motion") is True,
+                },
+            )
+            task = wait_for_agent_task(str(queued["task_id"]))
+        except (TypeError, ValueError, RuntimeError, KeyError) as exc:
+            abort(409, str(exc))
+        return agent_task_response(task)
+
+    @app.post("/api/agent/speech")
+    def synthesize_agent_speech():
+        require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "语音请求必须是JSON对象。")
+        voice = payload.get("voice", payload.get("preset", "taiwan_female"))
+        try:
+            audio = speech_synthesizer.synthesize(payload.get("text", ""), voice)
+        except ValueError as exc:
+            abort(400, str(exc))
+        except SpeechBusyError as exc:
+            return jsonify(ok=False, error=str(exc)), 429
+        except SpeechTimeoutError as exc:
+            return jsonify(ok=False, error=str(exc)), 504
+        except SpeechUnavailableError as exc:
+            return jsonify(ok=False, error=str(exc)), 503
+        except SpeechSynthesisError as exc:
+            return jsonify(ok=False, error=str(exc)), 502
+        response = Response(audio, mimetype="audio/mpeg")
+        response.headers["Content-Length"] = str(len(audio))
+        return response
+
+    @app.post("/api/agent/start")
+    def start_prepared_agent_motion():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "动作启动请求必须是JSON对象。")
+        task_id = payload.get("task_id", "")
+        if not isinstance(task_id, str) or not task_id or len(task_id) > 96:
+            abort(400, "task_id不正确。")
+        duration = payload.get("speech_duration_s")
+        if duration is not None:
+            if isinstance(duration, bool) or not isinstance(duration, (int, float)):
+                abort(400, "speech_duration_s必须是秒数。")
+            duration = float(duration)
+            if not math.isfinite(duration) or not 0.1 <= duration <= 120.0:
+                abort(400, "speech_duration_s必须在0.1到120秒之间。")
+        try:
+            task = agent_service.start_ready(
+                task_id, client_id=operator, speech_duration_s=duration,
+            )
+            task = wait_for_agent_task(str(task["task_id"]), timeout_s=10.0)
+        except (RuntimeError, KeyError, ValueError) as exc:
+            abort(409, str(exc))
+        return agent_task_response(task)
+
+    @app.post("/api/agent/confirm")
+    def confirm_agent_message():
+        require_operator()
+        payload = request.get_json(silent=True) or {}
+        task_id = str(payload.get("task_id", ""))
+        try:
+            task = agent_service.confirm(task_id)
+            task = wait_for_agent_task(str(task["task_id"]), timeout_s=10.0)
+        except (RuntimeError, KeyError, ValueError) as exc:
+            abort(409, str(exc))
+        return agent_task_response(task)
+
+    @app.post("/api/agent/cancel")
+    def cancel_agent_message():
+        require_operator()
+        payload = request.get_json(silent=True) or {}
+        task_id = str(payload.get("task_id", ""))
+        discard_only = payload.get("discard_only", False)
+        if not isinstance(discard_only, bool):
+            abort(400, "discard_only必须为布尔值。")
+        if discard_only and not task_id:
+            abort(400, "丢弃待执行任务时必须指定task_id。")
+        cancelled_task = None
+        if not task_id:
+            active = next(
+                (
+                    item
+                    for item in agent_service.history()
+                    if item.get("state") not in {"COMPLETED", "FAILED", "CANCELLED"}
+                ),
+                None,
+            )
+            task_id = "" if active is None else str(active["task_id"])
+        if task_id:
+            try:
+                cancelled_task = agent_service.cancel(task_id)
+            except KeyError:
+                cancelled_task = None
+        if discard_only:
+            # A rejected new task must never stop the unrelated, older motion
+            # which caused its rejection.  Explicit operator cancellation below
+            # retains the normal stop behaviour.
+            LOGGER.info("agent pending task discarded | task=%s stop_motion=false", task_id)
+            return jsonify(ok=True, message="本条待执行任务已丢弃。", task=cancelled_task)
+        agent_stop("operator cancelled Agent interaction")
+        return jsonify(
+            ok=True,
+            message="当前 Agent 交互和机械臂动作已取消。",
+            task=cancelled_task,
+        )
+
+    @app.get("/api/agent/status")
+    def agent_status():
+        value = client_id()
+        engine.heartbeat(value)
+        settings = agent_service.public_settings()
+        history = agent_service.history()
+        latest = history[0] if history else None
+        robot_status = engine.status(value)
+        motion = robot_status.get("agent_motion", {})
+        state = "idle"
+        message = "等待你的指令"
+        if isinstance(motion, dict) and motion.get("active"):
+            state = "executing"
+            message = str(motion.get("message") or "正在执行动作")
+        elif latest is not None:
+            state_map = {
+                "QUEUED": "thinking",
+                "THINKING": "thinking",
+                "DISPATCHING": "executing",
+                "READY": "idle",
+                "WAITING_CONFIRMATION": "idle",
+                "FAILED": "error",
+            }
+            state = state_map.get(str(latest.get("state")), "idle")
+            message = str(latest.get("error") or latest.get("reply") or message)
+        return jsonify(
+            ok=True,
+            status={
+                **settings,
+                "state": state,
+                "message": message,
+                "latest_task": latest,
+                "motion": motion,
+                "visual_proximity": robot_status.get("visual_proximity"),
+            },
+        )
+
+    @app.get("/api/agent/history")
+    def agent_history():
+        value = client_id()
+        engine.heartbeat(value)
+        messages: list[dict[str, str]] = []
+        for item in reversed(agent_service.history()):
+            original = str(item.get("original_text") or "")
+            if original:
+                messages.append({"role": "user", "content": original})
+            reply = str(item.get("reply") or "")
+            error = str(item.get("error") or "")
+            if reply or error:
+                plan = item.get("plan")
+                action_summary = ""
+                if isinstance(plan, dict):
+                    action_summary = "动作：" + "、".join(
+                        str(action.get("name", ""))
+                        for action in plan.get("actions", [])
+                        if isinstance(action, dict) and action.get("name")
+                    )
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "content": reply or f"执行失败：{error}",
+                        "action_summary": action_summary,
+                    }
+                )
+        return jsonify(ok=True, history=messages)
 
     return app
 
@@ -393,7 +814,7 @@ def main(argv: list[str] | None = None) -> int:
         robot_allowed=args.enable_robot,
         profile_path=profile_path,
     )
-    app = create_app(engine)
+    app = create_app(engine, preferences_path=config_path.parent / "agent_preferences.json")
     server = make_server("127.0.0.1", args.http_port, app, threaded=True)
     address = f"http://127.0.0.1:{args.http_port}/"
 
@@ -413,6 +834,7 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Stopping local control panel...")
     finally:
+        app.extensions["so101_agent_service"].shutdown()
         engine.shutdown()
         server.server_close()
     return 0

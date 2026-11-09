@@ -12,6 +12,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .agent_actions import (
+    AgentKeyframe,
+    AgentMotionPlan,
+    AgentMotionTiming,
+    VisualProximity,
+    build_agent_motion_plan,
+    calculate_agent_motion_timing,
+    estimate_visual_proximity,
+    step_toward_agent_target,
+)
 from .config import ALL_JOINTS, CONTROLLED_JOINTS, FIXED_JOINTS, AppConfig
 from .pose_detector import (
     MediaPipePoseDetector,
@@ -39,6 +49,19 @@ BASE_CALIBRATION_MIN_RAW_SPAN = 20
 BASE_CALIBRATION_MOTORS = tuple(joint.removesuffix(".pos") for joint in ALL_JOINTS)
 NEUTRAL_CAPTURE_TIMEOUT_S = 30.0
 CONTROL_CONFIRMATION_CODE = "123"
+AGENT_VISUAL_START_TIMEOUT_S = 15.0
+AGENT_KEYFRAME_TIMEOUT_S = 15.0
+AGENT_POSITION_TOLERANCE = 2.0  # LeRobot normalized positions, not degrees.
+AGENT_BODY_FEEDBACK_TOLERANCE = 3.0
+
+
+def _agent_feedback_tolerance(joint: str) -> float:
+    # Loaded body joints can settle ~2.05 units away from their goal.  This is
+    # an encoder arrival deadband, not an expansion of any travel/step limit.
+    return (
+        AGENT_POSITION_TOLERANCE if joint == "gripper.pos"
+        else AGENT_BODY_FEEDBACK_TOLERANCE
+    )
 
 
 LOGGER = logging.getLogger("so101_human_follow.control")
@@ -73,7 +96,7 @@ class ControlCommand:
 
 
 class ControlEngine:
-    """Single-owner runtime for camera, pose model, controller and serial bus."""
+    """Sole serial owner with an independent optional camera/inference worker."""
 
     def __init__(
         self,
@@ -96,9 +119,11 @@ class ControlEngine:
         self._motion_stop = threading.Event()
         self._motion_stop.set()
         self._thread: threading.Thread | None = None
+        self._vision_thread: threading.Thread | None = None
         self._epoch = 0
 
         self._preview_state = "STOPPED"
+        self._preview_error: str | None = None
         self._robot_state = "DISABLED" if not robot_allowed else "DISCONNECTED"
         self._armed = False
         self._message = "Waiting to start"
@@ -116,6 +141,31 @@ class ControlEngine:
         self._last_action = self._controller.hold()
         self._last_send_time: float | None = None
         self._last_motion_telemetry_time = 0.0
+
+        # Conversational Agent motion is a separate, semantic layer around the
+        # existing controller.  It never owns the serial bus: keyframes are
+        # advanced by this same control thread and sent through the same adapter.
+        self._agent_plan: AgentMotionPlan | None = None
+        self._agent_timing: AgentMotionTiming | None = None
+        self._agent_speech_duration_s: float | None = None
+        self._agent_plan_client: str | None = None
+        self._agent_plan_epoch: int | None = None
+        self._agent_plan_index = 0
+        self._agent_plan_started_at: float | None = None
+        self._agent_keyframe_reached_at: float | None = None
+        self._agent_keyframe_started_at: float | None = None
+        self._agent_visual_wait_started_at: float | None = None
+        self._agent_recovery_positions: dict[str, float] | None = None
+        self._agent_recovery_joints: tuple[str, ...] = ()
+        self._agent_hold_pending = False
+        self._agent_return_verified = False
+        self._agent_motion_state = "IDLE"
+        self._agent_motion_message = "No Agent motion is active"
+        self._agent_motion_error: str | None = None
+        self._pet_restore_positions: dict[str, float] | None = None
+        self._visual_proximity = VisualProximity("UNKNOWN", "not started")
+        self._visual_proximity_time: float | None = None
+        self._last_safe_visual_time: float | None = None
 
         self._calibration_fingerprint: str | None = None
         self._safe_profile: SafeRangeProfile | None = None
@@ -199,6 +249,9 @@ class ControlEngine:
             if thread.is_alive():
                 LOGGER.error("control thread did not stop within %.1f seconds", timeout_s)
                 print("WARNING: control thread did not stop; use the physical power switch if needed.")
+        vision_thread = self._vision_thread
+        if vision_thread is not None:
+            vision_thread.join(min(timeout_s, 2.0))
 
     def heartbeat(self, client_id: str) -> bool:
         if not client_id:
@@ -216,7 +269,7 @@ class ControlEngine:
                     # was already DISARMED.
                     self._motion_stop.set()
                     self._epoch += 1
-                if expired and self._armed:
+                if expired and (self._armed or self._agent_plan is not None):
                     disarm_reason = "operator lease expired"
                 # Native browser confirmation prompts pause JavaScript timers, so the
                 # status heartbeat can legitimately expire while the operator is
@@ -252,8 +305,11 @@ class ControlEngine:
         with self._send_lock:
             with self._lock:
                 was_armed = self._armed
+                was_agent_active = self._agent_plan is not None
                 self._armed = False
                 self._epoch += 1
+                if was_agent_active:
+                    self._cancel_agent_plan_locked(reason)
                 if self._range_state in {
                     "POSITIONING_FIXED",
                     "STARTING",
@@ -280,7 +336,12 @@ class ControlEngine:
                     self._robot_state = "CONNECTED_DISARMED"
                 if was_armed or reason != "operator request":
                     self._message = f"DISARMED: {reason}"
-        LOGGER.info("DISARM | reason=%s | was_armed=%s", reason, was_armed)
+        LOGGER.info(
+            "DISARM | reason=%s | was_armed=%s | agent_active=%s",
+            reason,
+            was_armed,
+            was_agent_active,
+        )
 
     def stop_following(self, reason: str = "operator pressed stop-following") -> None:
         """DISARM without making a false torque-hold promise during release."""
@@ -447,12 +508,40 @@ class ControlEngine:
                 if self._collecting_neutral
                 else None
             )
+            proximity_age = (
+                None
+                if self._visual_proximity_time is None
+                else max(0.0, now - self._visual_proximity_time)
+            )
+            agent_active = self._agent_plan is not None
+            agent_elapsed = (
+                None
+                if self._agent_plan_started_at is None
+                else max(0.0, now - self._agent_plan_started_at)
+            )
+            can_start_agent_motion = bool(
+                operator
+                and self._robot is not None
+                and self._robot.connected
+                and self._robot_state == "CONNECTED_DISARMED"
+                and not self._armed
+                and not agent_active
+                and self._safe_profile is not None
+                and not self._collecting_neutral
+                and self._range_state == "IDLE"
+                and not base_active
+                and not self._release_pending
+                and self._error is None
+            )
             can_arm = bool(
                 operator
                 and self._robot is not None
                 and self._robot.connected
                 and self._robot_state == "CONNECTED_DISARMED"
+                and not agent_active
+                and not self._release_pending
                 and profile_ready
+                and self._preview_state == "RUNNING"
                 and self._neutral is not None
                 and not self._collecting_neutral
                 and self._latest_features is not None
@@ -506,6 +595,7 @@ class ControlEngine:
 
             return {
                 "preview_state": self._preview_state,
+                "preview_error": self._preview_error,
                 "robot_allowed": self.robot_allowed,
                 "robot_state": self._robot_state,
                 "robot_connected": bool(self._robot is not None and self._robot.connected),
@@ -535,6 +625,38 @@ class ControlEngine:
                 "lease_age_s": lease_age,
                 "lease_timeout_s": self.lease_timeout_s,
                 "can_arm": can_arm,
+                "can_start_agent_motion": can_start_agent_motion,
+                "visual_proximity": {
+                    "state": self._visual_proximity.state,
+                    "reason": self._visual_proximity.reason,
+                    "shoulder_size": self._visual_proximity.shoulder_size,
+                    "palm_size": self._visual_proximity.palm_size,
+                    "age_s": proximity_age,
+                    "metric_distance_available": False,
+                },
+                "agent_motion": {
+                    "state": self._agent_motion_state,
+                    "active": agent_active,
+                    "name": None if self._agent_plan is None else self._agent_plan.name,
+                    "step_index": self._agent_plan_index,
+                    "step_count": (
+                        0 if self._agent_plan is None else len(self._agent_plan.keyframes)
+                    ),
+                    "elapsed_s": agent_elapsed,
+                    "message": self._agent_motion_message,
+                    "error": self._agent_motion_error,
+                    "pet_pose_saved": self._pet_restore_positions is not None,
+                    "recovery_available": self._agent_recovery_positions is not None,
+                    "return_verified": self._agent_return_verified,
+                    "timing": None if self._agent_timing is None else {
+                        "speech_duration_s": self._agent_speech_duration_s,
+                        "estimated_remaining_s": self._agent_timing.estimated_duration_s,
+                        "speeds": dict(self._agent_timing.speeds),
+                        "max_speeds": dict(self._agent_timing.max_speeds),
+                        "reason": self._agent_timing.reason,
+                        "units": "normalized_positions_per_second",
+                    },
+                },
                 "safe_range": {
                     "state": self._range_state,
                     "profile_ready": profile_ready,
@@ -570,7 +692,6 @@ class ControlEngine:
                 "can_connect": bool(
                     operator
                     and self.robot_allowed
-                    and self._preview_state == "RUNNING"
                     and self._robot is None
                     and self._robot_state in {"DISCONNECTED", "FAULT"}
                     and not base_active
@@ -578,7 +699,6 @@ class ControlEngine:
                 "can_start_base_calibration": bool(
                     operator
                     and self.robot_allowed
-                    and self._preview_state == "RUNNING"
                     and self._robot is None
                     and not base_active
                 ),
@@ -597,6 +717,9 @@ class ControlEngine:
                     and self._preview_state == "RUNNING"
                     and self._latest_features is not None
                     and not self._armed
+                    and not agent_active
+                    and not self._release_pending
+                    and not self._collecting_neutral
                     and (not self.robot_allowed or profile_ready)
                     and self._range_state == "IDLE"
                     and (
@@ -709,12 +832,14 @@ class ControlEngine:
             raise ControlError("The browser control lease expired before the command ran.")
         if command.name in {
             "arm",
+            "agent_plan_start",
             "start_safe_range",
             "start_base_calibration",
             "start_base_range",
         } and command.submitted_epoch != current_epoch:
             action = {
                 "arm": "ARM",
+                "agent_plan_start": "Agent motion",
                 "start_safe_range": "Safe-range start",
                 "start_base_calibration": "Base-calibration start",
                 "start_base_range": "Base-range start",
@@ -777,7 +902,271 @@ class ControlEngine:
                 client_id=command.client_id,
                 submitted_epoch=command.submitted_epoch,
             )
+        if name == "agent_plan_start":
+            return self._start_agent_plan(
+                payload.get("actions"),
+                client_id=command.client_id,
+                submitted_epoch=command.submitted_epoch,
+                speech_duration_s=payload.get("speech_duration_s"),
+            )
+        if name == "agent_plan_cancel":
+            return self._cancel_agent_plan("operator cancelled Agent motion")
         raise ControlError(f"Unknown control command: {name}")
+
+    def _start_agent_plan(
+        self,
+        actions: Any,
+        *,
+        client_id: str | None,
+        submitted_epoch: int | None,
+        speech_duration_s: float | None = None,
+    ) -> dict[str, Any]:
+        """Validate and schedule semantic keyframes without blocking the web call."""
+
+        now = time.monotonic()
+        with self._send_lock, self._lock:
+            if not self._lease_valid_locked(client_id, now):
+                raise ControlError("The browser control lease expired before Agent motion.")
+            if submitted_epoch is None or submitted_epoch != self._epoch:
+                raise ControlError("Agent motion was cancelled by a newer STOP/DISARM action.")
+            if self._robot is None or not self._robot.connected:
+                raise ControlError("Connect the robot before starting an Agent motion.")
+            if self._robot_state != "CONNECTED_DISARMED" or self._armed:
+                raise ControlError(
+                    "Agent motion requires a connected, DISARMED robot; stop human following first."
+                )
+            if self._agent_plan is not None:
+                raise ControlError("上一个机械臂动作仍在执行或回位，请完成后再发送，或先点击停止。")
+            if self._safe_profile is None:
+                raise ControlError("A saved/configured servo safety envelope is required.")
+            if self._range_state != "IDLE" or self._base_calibration_state in {
+                "STARTING",
+                "WAITING_MIDDLE",
+                "MIDDLE_CAPTURED",
+                "RECORDING",
+                "RANGE_INCOMPLETE",
+                "SAVING",
+                "CANCELLING",
+            }:
+                raise ControlError("Finish or cancel servo calibration before Agent motion.")
+            if self._collecting_neutral or self._release_pending:
+                raise ControlError("Finish the current robot operation before Agent motion.")
+            if self._error is not None:
+                raise ControlError(f"Resolve the runtime fault first: {self._error}")
+            # Every request starts from an encoder snapshot, not a possibly
+            # unfinished goal left by the previous request.
+            current = (
+                self._robot.hold_current() if hasattr(self._robot, "hold_current")
+                else self._robot.read_positions()
+            )
+            if set(current) != set(ALL_JOINTS) or not all(
+                math.isfinite(float(value)) for value in current.values()
+            ):
+                raise ControlError("无法读取完整有效的机械臂位置，本次动作没有启动。")
+            current = {joint: float(current[joint]) for joint in ALL_JOINTS}
+            # Semantic Agent gestures use the robot's connection/home pose and
+            # must not depend on the separately captured human neutral features.
+            home = dict(self._initial)
+            recovery_requested = any(
+                isinstance(item, dict) and item.get("name") == "return_to_action_start"
+                for item in (actions if isinstance(actions, list) else [])
+            )
+            if recovery_requested:
+                if len(actions) != 1:
+                    raise ControlError("请单独发送“回到刚才的位置”，不要与其他动作混合。")
+                if self._agent_recovery_positions is None:
+                    raise ControlError("还没有记录上次动作的起始位置。")
+                home = dict(self._agent_recovery_positions)
+            limits = dict(self._safe_profile.controlled_limits)
+            fixed = dict(self._safe_profile.fixed_positions)
+            pet_restore = (
+                None
+                if self._pet_restore_positions is None
+                else dict(self._pet_restore_positions)
+            )
+            gripper_open_is_high = (
+                self.config.mapping.signs.get("gripper.pos", 1.0) >= 0.0
+            )
+
+            try:
+                plan = build_agent_motion_plan(
+                    actions,
+                    current_positions=current,
+                    home_positions=home,
+                    limits=limits,
+                    fixed_positions=fixed,
+                    gripper_open_is_high=gripper_open_is_high,
+                    pet_restore_positions=pet_restore,
+                    recovery_joints=self._agent_recovery_joints if recovery_requested else None,
+                )
+                timing = calculate_agent_motion_timing(
+                    plan, current,
+                    max_step_per_cycle=self.config.safety.max_step_per_cycle,
+                    max_relative_target=self.config.robot.max_relative_target,
+                    base_control_hz=self.config.robot.control_hz,
+                    speech_duration_s=speech_duration_s,
+                    proximity_speed_scale=1.0,
+                )
+                for frame in plan.keyframes:
+                    for joint in frame.active_joints:
+                        low, high = limits[joint]
+                        if not low <= frame.targets[joint] <= high:
+                            raise ValueError(f"{joint} 的动作或回位目标超出安全范围。")
+            except (TypeError, ValueError) as exc:
+                raise ControlError(f"Invalid Agent motion plan: {exc}") from exc
+
+            self._epoch += 1
+            self._agent_plan = plan
+            self._agent_timing = timing
+            self._agent_speech_duration_s = speech_duration_s
+            if not recovery_requested:
+                self._agent_recovery_positions = dict(current)
+                self._agent_recovery_joints = tuple(
+                    joint for joint in CONTROLLED_JOINTS
+                    if any(joint in frame.active_joints for frame in plan.keyframes)
+                )
+            self._agent_return_verified = False
+            self._agent_hold_pending = False
+            self._last_action = dict(current)
+            self._range_current = dict(current)
+            self._controller.reset_to(current)
+            self._agent_plan_client = client_id
+            self._agent_plan_epoch = self._epoch
+            self._agent_plan_index = 0
+            self._agent_plan_started_at = now
+            self._agent_keyframe_reached_at = None
+            self._agent_keyframe_started_at = None
+            self._agent_visual_wait_started_at = None
+            self._agent_motion_state = "RUNNING"
+            self._agent_motion_error = None
+            self._agent_motion_message = f"对话动作已开始：{plan.name}（不依赖视觉）"
+            self._motion_stop.clear()
+            if plan.pet_restore_to_save is not None:
+                self._pet_restore_positions = dict(plan.pet_restore_to_save)
+            self._message = self._agent_motion_message
+
+        LOGGER.info(
+            "agent motion scheduled | name=%s keyframes=%d visual_guard=disabled state=%s start_measured=%s",
+            plan.name,
+            len(plan.keyframes),
+            self._agent_motion_state,
+            current,
+        )
+        LOGGER.info(
+            "agent timing | speech_s=%s estimated_s=%.2f hz=%.1f min_speeds=%s max_speeds=%s speeds=%s reason=%s",
+            speech_duration_s, timing.estimated_duration_s, timing.control_hz,
+            timing.min_speeds, timing.max_speeds, timing.speeds, timing.reason,
+        )
+        return {
+            "ok": True,
+            "message": self._agent_motion_message,
+            "agent_motion": {
+                "state": self._agent_motion_state,
+                "name": plan.name,
+                "step_count": len(plan.keyframes),
+            },
+        }
+
+    def _cancel_agent_plan_locked(self, reason: str) -> bool:
+        if self._agent_plan is None:
+            return False
+        name = self._agent_plan.name
+        self._agent_plan = None
+        self._agent_plan_client = None
+        self._agent_plan_epoch = None
+        self._agent_plan_index = 0
+        self._agent_plan_started_at = None
+        self._agent_keyframe_reached_at = None
+        self._agent_keyframe_started_at = None
+        self._agent_visual_wait_started_at = None
+        self._agent_hold_pending = True
+        self._agent_return_verified = False
+        self._agent_motion_state = "CANCELLED"
+        self._agent_motion_error = str(reason)
+        self._agent_motion_message = f"Agent motion cancelled: {reason}"
+        LOGGER.warning("agent motion cancelled | name=%s reason=%s", name, reason)
+        return True
+
+    def _cancel_agent_plan(self, reason: str) -> dict[str, Any]:
+        with self._send_lock:
+            with self._lock:
+                cancelled = self._cancel_agent_plan_locked(reason)
+                if cancelled:
+                    self._epoch += 1
+                    self._message = self._agent_motion_message
+        return {
+            "ok": True,
+            "message": (
+                self._agent_motion_message
+                if cancelled
+                else "No Agent motion is active."
+            ),
+        }
+
+    def _complete_agent_plan_locked(self) -> None:
+        plan = self._agent_plan
+        if plan is None:
+            return
+        if plan.clear_pet_restore_on_complete:
+            self._pet_restore_positions = None
+        self._agent_hold_pending = False
+        touched = {joint for frame in plan.keyframes for joint in frame.active_joints}
+        self._agent_return_verified = bool(
+            touched and self._agent_recovery_positions is not None and self._range_current is not None
+            and all(
+                abs(self._range_current[joint] - self._agent_recovery_positions[joint])
+                <= _agent_feedback_tolerance(joint) for joint in touched
+            )
+        )
+        name = plan.name
+        actual_elapsed = (
+            None if self._agent_plan_started_at is None
+            else time.monotonic() - self._agent_plan_started_at
+        )
+        self._agent_plan = None
+        self._agent_plan_client = None
+        self._agent_plan_epoch = None
+        self._agent_plan_index = 0
+        self._agent_plan_started_at = None
+        self._agent_keyframe_reached_at = None
+        self._agent_keyframe_started_at = None
+        self._agent_visual_wait_started_at = None
+        self._agent_motion_state = "COMPLETE"
+        self._agent_motion_error = None
+        self._agent_motion_message = f"Agent motion complete: {name}"
+        self._motion_stop.set()
+        self._message = self._agent_motion_message
+        LOGGER.info(
+            "agent motion completed | name=%s actual_elapsed_s=%s speech_duration_s=%s return_verified=%s measured=%s",
+            name, actual_elapsed, self._agent_speech_duration_s,
+            self._agent_return_verified, self._range_current,
+        )
+
+    def _hold_agent_if_pending(self) -> None:
+        """The serial owner seeds an interrupted motion at its measured pose."""
+        with self._send_lock:
+            with self._lock:
+                if not self._agent_hold_pending:
+                    return
+                self._agent_hold_pending = False
+                robot = self._robot
+                if robot is None or not robot.connected or self._release_pending:
+                    return
+                if getattr(robot, "manual_range_active", False) or getattr(robot, "fixed_positioning_active", False):
+                    return
+            try:
+                measured = robot.hold_current() if hasattr(robot, "hold_current") else robot.read_positions()
+                with self._lock:
+                    self._range_current = dict(measured)
+                    self._last_action = dict(measured)
+                    self._controller.reset_to(measured)
+                LOGGER.info("interrupted Agent goal held at measured pose | positions=%s", measured)
+            except Exception as exc:
+                LOGGER.exception("could not hold interrupted Agent motion")
+                with self._lock:
+                    self._agent_motion_state = "FAULT"
+                    self._agent_motion_error = f"停止后的当前位置读取失败：{exc}"
+                    self._error = self._agent_motion_error
 
     def _start_base_calibration(
         self,
@@ -1115,8 +1504,16 @@ class ControlEngine:
         with self._lock:
             if not self._lease_valid_locked(client_id, time.monotonic()):
                 raise ControlError("The browser control lease expired before connection.")
-            if self._preview_state != "RUNNING":
-                raise ControlError("Camera/pose preview is not running.")
+            if self._base_calibration is not None or self._base_calibration_state in {
+                "STARTING",
+                "WAITING_MIDDLE",
+                "MIDDLE_CAPTURED",
+                "RECORDING",
+                "RANGE_INCOMPLETE",
+                "SAVING",
+                "CANCELLING",
+            }:
+                raise ControlError("Finish or cancel base calibration before connecting the robot.")
             if self._robot is not None:
                 raise ControlError("Robot is already connected or connecting.")
             self._robot_state = "CONNECTING"
@@ -1202,16 +1599,26 @@ class ControlEngine:
             self._range_started_at = None
             self._range_cancel_requested = None
             self._range_current = dict(initial)
+            self._agent_recovery_positions = None
+            self._agent_recovery_joints = ()
+            self._agent_return_verified = False
+            self._agent_hold_pending = False
             self._range_mins.clear()
             self._range_maxes.clear()
             self._neutral = None
             self._clear_neutral_samples_locked()
             self._collecting_neutral = False
+            self._pet_restore_positions = None
+            self._agent_motion_state = "IDLE"
+            self._agent_motion_message = "No Agent motion is active"
+            self._agent_motion_error = None
             self._robot_state = "CONNECTED_DISARMED"
             self._message = (
-                "Robot connected in TEST MODE; safe-range capture skipped, collect neutral pose"
+                "Robot connected in TEST MODE; Agent gestures are available now; "
+                "collect human neutral pose only before visual following"
                 if self.config.safety.skip_safe_range_calibration
-                else "Robot connected; safe range ready, collect neutral pose"
+                else "Robot connected; safe range ready; Agent gestures are available now; "
+                "collect human neutral pose only before visual following"
                 if profile is not None
                 else "Robot connected; confirm ID1-ID2 and collect the ID3-ID6 safe range"
             )
@@ -1622,7 +2029,10 @@ class ControlEngine:
             self._neutral = None
             self._clear_neutral_samples_locked()
             self._collecting_neutral = False
-            self._message = "Safe range saved; collect the human neutral pose next"
+            self._message = (
+                "Safe range saved; Agent gestures are available now; "
+                "collect human neutral pose only before visual following"
+            )
         LOGGER.info("safe range saved and ID3-ID6 locked | current=%s", positions)
         return {"ok": True, "message": self._message}
 
@@ -1745,25 +2155,44 @@ class ControlEngine:
             self._range_started_at = None
             self._range_cancel_requested = None
             self._range_current = None
+            self._agent_recovery_positions = None
+            self._agent_recovery_joints = ()
+            self._agent_return_verified = False
+            self._agent_hold_pending = False
             self._range_mins.clear()
             self._range_maxes.clear()
             self._neutral = None
             self._clear_neutral_samples_locked()
             self._collecting_neutral = False
+            self._pet_restore_positions = None
+            self._agent_motion_state = "IDLE"
+            self._agent_motion_message = "No Agent motion is active"
+            self._agent_motion_error = None
             self._robot_state = "DISCONNECTED"
             self._error = None
             self._message = "Robot disconnected; torque was released"
         return {"ok": True, "message": self._message}
 
     def _start_neutral_collection(self) -> dict[str, Any]:
-        self.disarm("neutral collection started")
         with self._lock:
+            if self._agent_plan is not None:
+                raise ControlError(
+                    "Finish or cancel the active Agent motion before neutral-pose collection."
+                )
+            if self._release_pending:
+                raise ControlError(
+                    "Torque release is queued or in progress; neutral-pose collection is not allowed."
+                )
             if self._preview_state != "RUNNING" or self._latest_features is None:
                 raise ControlError("At least one reliable arm or hand channel is required.")
             if self.robot_allowed and self._safe_profile is None:
                 raise ControlError("Complete and save the servo safe-range calibration first.")
             if self._range_state != "IDLE":
                 raise ControlError("Finish or cancel safe-range capture first.")
+        # Validate first: a malformed or premature neutral request must not cancel
+        # a running Agent gesture or human-following session as a side effect.
+        self.disarm("neutral collection started")
+        with self._lock:
             self._neutral = None
             self._clear_neutral_samples_locked()
             self._collecting_neutral = True
@@ -1794,6 +2223,10 @@ class ControlEngine:
                 raise ControlError("The browser control lease expired before final ARM.")
             if submitted_epoch is None or submitted_epoch != self._epoch:
                 raise ControlError("ARM was cancelled by a newer STOP/DISARM action.")
+            if self._agent_plan is not None:
+                raise ControlError("Finish or cancel the active Agent motion before ARM.")
+            if self._release_pending:
+                raise ControlError("Torque release is queued or in progress; ARM is not allowed.")
             if self._robot is None or not self._robot.connected:
                 raise ControlError("Robot is not connected.")
             if self._robot_state != "CONNECTED_DISARMED":
@@ -1802,6 +2235,8 @@ class ControlEngine:
                 raise ControlError("Servo safe-range calibration is incomplete.")
             if self._collecting_neutral or self._neutral is None:
                 raise ControlError("Neutral-pose collection is incomplete.")
+            if self._preview_state != "RUNNING":
+                raise ControlError("Camera/pose preview is not running for visual following.")
             if self._latest_features is None or self._last_pose_time is None:
                 raise ControlError("No reliable pose is available.")
             if now - self._last_pose_time > self.config.safety.tracking_timeout_s:
@@ -1827,7 +2262,7 @@ class ControlEngine:
             ):
                 self._operator_client = None
                 self._epoch += 1
-                expired = self._armed
+                expired = self._armed or self._agent_plan is not None
                 # Do not cancel torque-free/manual calibration here. Browser prompt()
                 # blocks its own heartbeat timer, and the same local tab will
                 # reacquire the lease on its next API request. Powered following is
@@ -1838,6 +2273,10 @@ class ControlEngine:
     def _update_tracking(self, detection: PoseDetection, now: float) -> PoseDetection:
         features = detection.features
         valid_features = frozenset(set(detection.valid_features) & set(CONTROL_FEATURES))
+        proximity = estimate_visual_proximity(
+            detection,
+            aspect_ratio=self.config.camera.width / self.config.camera.height,
+        )
         with self._lock:
             if (
                 features is not None
@@ -1872,6 +2311,11 @@ class ControlEngine:
             self._detection = detection
             self._latest_features = features
             self._latest_valid_features = valid_features
+            self._visual_proximity = proximity
+            self._visual_proximity_time = now
+            if proximity.state in {"SAFE", "SLOW"}:
+                self._last_safe_visual_time = now
+            powered_motion_active = self._armed
             timed_out = bool(
                 self._armed
                 and self._last_pose_time is not None
@@ -1924,10 +2368,19 @@ class ControlEngine:
         # Moving a joint therefore moves the camera and can transiently look like a
         # person switch or multiple people. Tracking faults must still DISARM normal
         # powered following, but must not abort either manual calibration workflow.
-        if hard_fault and not manual_servo_calibration_active:
-            self.disarm(detection.reason)
+        visual_stop_reason = None
+        if proximity.state == "TOO_CLOSE" and powered_motion_active:
+            visual_stop_reason = "visual proximity TOO_CLOSE"
+        elif hard_fault and not manual_servo_calibration_active:
+            visual_stop_reason = detection.reason
         elif timed_out:
-            self.disarm("all control channels timed out")
+            visual_stop_reason = "all control channels timed out"
+        if visual_stop_reason is not None:
+            # Recheck the mode under the same write gate as STOP: an old camera
+            # frame must never cancel a newly started conversation gesture.
+            with self._send_lock, self._lock:
+                if self._armed:
+                    self.disarm(visual_stop_reason)
         return detection
 
     def _send_if_due(
@@ -2002,6 +2455,213 @@ class ControlEngine:
                     )
         return now
 
+    def _send_agent_if_due(self, now: float, last_control_time: float) -> float:
+        """Advance one semantic Agent keyframe on the sole serial-owner thread."""
+
+        agent_hz = self._agent_timing.control_hz if self._agent_timing else self.config.robot.control_hz
+        if now - last_control_time < 1.0 / agent_hz:
+            return last_control_time
+
+        cancel_reason: str | None = None
+        with self._lock:
+            plan = self._agent_plan
+            if plan is None:
+                return last_control_time
+            if not self._lease_valid_locked(self._agent_plan_client, now):
+                cancel_reason = "Agent control lease expired"
+            elif (
+                self._robot is None
+                or not self._robot.connected
+                or self._robot_state != "CONNECTED_DISARMED"
+                or self._armed
+            ):
+                cancel_reason = "robot state no longer permits Agent motion"
+            # Conversation gestures have no camera/recognition prerequisite.
+            # Their guards are lease, STOP, encoder feedback and joint limits.
+
+            if cancel_reason is None and self._agent_keyframe_started_at is None:
+                self._agent_keyframe_started_at = now
+            if (
+                cancel_reason is None
+                and self._agent_keyframe_reached_at is None
+                and now - self._agent_keyframe_started_at > AGENT_KEYFRAME_TIMEOUT_S
+            ):
+                cancel_reason = "舵机未在规定时间内到位，动作已停止；请检查负载、供电和活动范围。"
+
+            if cancel_reason is None and self._agent_keyframe_reached_at is not None:
+                frame = plan.keyframes[self._agent_plan_index]
+                if now - self._agent_keyframe_reached_at < frame.hold_s:
+                    return last_control_time
+                LOGGER.info(
+                    "agent keyframe completed | plan=%s step=%d/%d label=%s",
+                    plan.name,
+                    self._agent_plan_index + 1,
+                    len(plan.keyframes),
+                    frame.label,
+                )
+                self._agent_plan_index += 1
+                self._agent_keyframe_reached_at = None
+                self._agent_keyframe_started_at = now
+                if self._agent_plan_index >= len(plan.keyframes):
+                    self._complete_agent_plan_locked()
+                    return last_control_time
+
+            if cancel_reason is None:
+                frame = plan.keyframes[self._agent_plan_index]
+                robot = self._robot
+                controller = self._controller
+                epoch = self._agent_plan_epoch
+                previous = dict(self._last_action)
+                fixed = dict(self._safe_profile.fixed_positions) if self._safe_profile else {}
+                active_joints = tuple(frame.active_joints)
+                if not set(active_joints) <= set(CONTROLLED_JOINTS):
+                    raise RuntimeError("Agent frame requested an unsupported joint.")
+                remaining_speech = (
+                    None if self._agent_speech_duration_s is None else max(
+                        0.0, self._agent_speech_duration_s - (now - self._agent_plan_started_at)
+                    )
+                )
+                timing = calculate_agent_motion_timing(
+                    AgentMotionPlan(plan.name, plan.keyframes[self._agent_plan_index:]),
+                    dict(self._range_current) if self._range_current is not None else previous,
+                    max_step_per_cycle=self.config.safety.max_step_per_cycle,
+                    max_relative_target=self.config.robot.max_relative_target,
+                    base_control_hz=self.config.robot.control_hz,
+                    speech_duration_s=remaining_speech,
+                    proximity_speed_scale=1.0,
+                )
+                self._agent_timing = timing
+                self._agent_motion_state = (
+                    "RETURNING" if "restore" in frame.label.lower() or "return" in frame.label.lower()
+                    else "RUNNING"
+                )
+                self._agent_motion_message = (
+                    f"Agent motion {self._agent_plan_index + 1}/{len(plan.keyframes)}: "
+                    f"{frame.label}"
+                )
+
+        if cancel_reason is not None:
+            LOGGER.warning("agent safety interception | reason=%s", cancel_reason)
+            self.disarm(cancel_reason)
+            return last_control_time
+
+        try:
+            effective_target = dict(previous)
+            effective_target.update({joint: frame.targets[joint] for joint in active_joints})
+            planned, reached = step_toward_agent_target(
+                previous,
+                effective_target,
+                fixed_positions=fixed,
+                max_step=timing.steps,
+                speed_scale=1.0,
+            )
+        except Exception as exc:
+            self.disarm("Agent motion planning failed")
+            with self._lock:
+                self._agent_motion_state = "FAULT"
+                self._agent_motion_error = str(exc)
+                self._agent_motion_message = f"Agent motion planning failed: {exc}"
+                self._message = self._agent_motion_message
+            return last_control_time
+
+        # send_action() returns the goal actually SENT, not the measured pose.
+        # Even when the last goal matches, read the encoders before advancing.
+        needs_write = not all(
+            abs(planned[joint] - previous[joint]) <= 1e-6 for joint in active_joints
+        )
+
+        with self._send_lock:
+            with self._lock:
+                cancelled = bool(
+                    self._agent_plan is not plan
+                    or self._agent_plan_epoch != epoch
+                    or self._robot is not robot
+                    or self._robot_state != "CONNECTED_DISARMED"
+                    or self._armed
+                    or self._motion_stop.is_set()
+                )
+            if cancelled:
+                return last_control_time
+
+            try:
+                if needs_write and hasattr(robot, "send_agent_targets"):
+                    actual, observed = robot.send_agent_targets(planned, active_joints, fixed)
+                elif needs_write and hasattr(robot, "send_observed"):
+                    actual, observed = robot.send_observed(planned)
+                else:
+                    actual = robot.send(planned) if needs_write else previous
+                    observed = robot.read_positions()
+                if set(actual) != set(ALL_JOINTS):
+                    raise RuntimeError("Robot returned an incomplete Agent action record.")
+                actual = {joint: float(actual[joint]) for joint in ALL_JOINTS}
+                if not all(math.isfinite(value) for value in actual.values()):
+                    raise RuntimeError("Robot returned a non-finite Agent action value.")
+                if set(observed) != set(ALL_JOINTS):
+                    raise RuntimeError("Robot returned incomplete measured Agent positions.")
+                observed = {joint: float(observed[joint]) for joint in ALL_JOINTS}
+                if not all(math.isfinite(value) for value in observed.values()):
+                    raise RuntimeError("Robot returned non-finite measured Agent positions.")
+                position_error = max(
+                    (abs(frame.targets[joint] - observed[joint]) for joint in active_joints),
+                    default=0.0,
+                )
+                reached = bool(
+                    all(
+                        abs(frame.targets[joint] - observed[joint]) <= _agent_feedback_tolerance(joint)
+                        for joint in active_joints
+                    )
+                    and all(
+                        abs(frame.targets[joint] - actual[joint]) <= AGENT_POSITION_TOLERANCE
+                        for joint in active_joints
+                    )
+                )
+            except Exception as exc:
+                self.disarm("Agent serial command failed")
+                with self._lock:
+                    self._robot_state = "FAULT"
+                    self._error = f"Agent serial command failed: {exc}"
+                    self._agent_motion_state = "FAULT"
+                    self._agent_motion_error = str(exc)
+                    self._agent_motion_message = self._error
+                    self._message = self._error
+                return last_control_time
+
+            controller.reset_to(actual)
+            with self._lock:
+                if self._agent_plan is plan and self._agent_plan_epoch == epoch:
+                    self._last_action = actual
+                    self._range_current = observed
+                    self._last_send_time = now
+                    if reached:
+                        self._agent_keyframe_reached_at = now
+                        LOGGER.info(
+                            "agent keyframe measured arrival | plan=%s step=%d/%d label=%s max_error=%.2f measured=%s",
+                            plan.name,
+                            self._agent_plan_index + 1,
+                            len(plan.keyframes),
+                            frame.label,
+                            position_error,
+                            observed,
+                        )
+                    if now - self._last_motion_telemetry_time >= 0.5:
+                        self._last_motion_telemetry_time = now
+                        LOGGER.info(
+                            "agent motion telemetry | step=%d/%d label=%s proximity=%s target=%s sent=%s measured=%s max_error=%.2f feedback_tolerances=%s speeds=%s remaining_speech=%s estimated_s=%.2f",
+                            self._agent_plan_index + 1,
+                            len(plan.keyframes),
+                            frame.label,
+                            self._visual_proximity.state,
+                            frame.targets,
+                            actual,
+                            observed,
+                            position_error,
+                            {joint: _agent_feedback_tolerance(joint) for joint in active_joints},
+                            timing.speeds,
+                            remaining_speech,
+                            timing.estimated_duration_s,
+                        )
+        return now
+
     def _publish_frame(self, frame, detection: PoseDetection, now: float) -> None:
         import cv2
 
@@ -2021,6 +2681,10 @@ class ControlEngine:
                     if self._collecting_neutral
                     else f"neutral: {'ready' if self._neutral is not None else 'not ready'}"
                 ),
+                (
+                    f"proximity: {self._visual_proximity.state} | agent: "
+                    f"{self._agent_motion_state}"
+                ),
                 "ID1-2 FIXED | ID3-6 INDEPENDENT | physical power is the real E-stop",
             ]
         annotated = annotate_frame(frame, detection, status_lines)
@@ -2033,30 +2697,17 @@ class ControlEngine:
             self._last_frame_time = now
             self._frame_condition.notify_all()
 
-    def _run(self) -> None:
+    def _vision_loop(self) -> None:
+        """Optional camera worker.  It never reads or writes the servo bus."""
         camera = None
         detector = None
-        last_control_time = 0.0
         try:
             detector = MediaPipePoseDetector(self.config.pose)
             camera = self._open_camera()
             with self._lock:
                 self._preview_state = "RUNNING"
-                self._message = (
-                    "Preview running; robot control is disabled"
-                    if not self.robot_allowed
-                    else "Preview running; robot is not connected"
-                )
-                self._error = None
-
+                self._preview_error = None
             while not self._shutdown.is_set():
-                self._process_commands()
-                if self._shutdown.is_set():
-                    break
-                now = time.monotonic()
-                self._lease_watchdog(now)
-                self._poll_base_calibration(now)
-                self._poll_safe_range(now)
                 ok, frame = camera.read()
                 if not ok:
                     raise RuntimeError("Camera read failed.")
@@ -2067,17 +2718,69 @@ class ControlEngine:
                     flip_vertical=self.config.camera.flip_vertical,
                 )
                 detection = detector.detect(frame)
-                # Freshness must be measured after both inference passes finish.
                 now = time.monotonic()
                 detection = self._update_tracking(detection, now)
-                if detection.features is not None:
+                self._publish_frame(frame, detection, now)
+        except Exception as exc:
+            LOGGER.warning("optional vision worker failed | error=%s", exc)
+            with self._send_lock, self._lock:
+                self._preview_state = "FAULT"
+                self._preview_error = str(exc)
+                self._collecting_neutral = False
+                if self._armed:
+                    self.disarm("visual preview failed")
+        finally:
+            for resource, method in ((detector, "close"), (camera, "release")):
+                if resource is not None:
+                    try:
+                        getattr(resource, method)()
+                    except Exception:
+                        LOGGER.exception("optional vision cleanup failed")
+            with self._frame_condition:
+                self._frame_condition.notify_all()
+
+    def _run(self) -> None:
+        camera = None
+        detector = None
+        last_control_time = 0.0
+        try:
+            with self._lock:
+                self._message = "控制服务已就绪；对话动作不依赖摄像头。"
+                self._error = None
+            self._vision_thread = threading.Thread(
+                target=self._vision_loop, name="so101-optional-vision", daemon=True
+            )
+            self._vision_thread.start()
+
+            while not self._shutdown.is_set():
+                self._process_commands()
+                if self._shutdown.is_set():
+                    break
+                now = time.monotonic()
+                self._lease_watchdog(now)
+                self._poll_base_calibration(now)
+                self._poll_safe_range(now)
+                self._hold_agent_if_pending()
+                with self._lock:
+                    features = self._latest_features
+                    valid_features = self._latest_valid_features
+                    human_active = self._armed
+                    camera_fresh = bool(
+                        self._preview_state == "RUNNING"
+                        and self._last_frame_time is not None
+                        and now - self._last_frame_time <= self.config.safety.tracking_timeout_s
+                    )
+                if human_active and not camera_fresh:
+                    self.disarm("visual preview is stale")
+                elif human_active and features is not None:
                     last_control_time = self._send_if_due(
-                        detection.features,
+                        features,
                         now,
                         last_control_time,
-                        valid_features=detection.valid_features,
+                        valid_features=valid_features,
                     )
-                self._publish_frame(frame, detection, now)
+                last_control_time = self._send_agent_if_due(now, last_control_time)
+                self._shutdown.wait(0.005)
         except Exception as exc:
             with self._lock:
                 base_active = self._base_calibration is not None
