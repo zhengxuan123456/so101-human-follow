@@ -60,7 +60,7 @@ class SafeRangeProfileTest(unittest.TestCase):
 
 class DynamicLimitTest(unittest.TestCase):
     def test_motion_controller_never_exceeds_user_safe_range(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         limits = {
             "elbow_flex.pos": (-0.5, 0.5),
             "wrist_flex.pos": (-0.5, 0.5),
@@ -86,7 +86,7 @@ class DynamicLimitTest(unittest.TestCase):
 
 class ManualRangeAdapterTest(unittest.TestCase):
     def test_only_controlled_joints_are_released_and_current_goal_precedes_enable(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         events = []
         observations = preview_initial_positions()
         observations.update(
@@ -136,7 +136,7 @@ class ManualRangeAdapterTest(unittest.TestCase):
 
 class SafeRangeArmGateTest(unittest.TestCase):
     def test_arm_is_rejected_until_safe_profile_exists(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_safe_range_gate"
         engine.heartbeat(client_id)

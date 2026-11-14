@@ -8,8 +8,11 @@
     <title>SO-101 语音 Agent 控制台</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='agent-theme.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='simulation.css') }}">
     <script src="{{ url_for('static', filename='app.js') }}" defer></script>
     <script src="{{ url_for('static', filename='agent-ui.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='teaching.js') }}" defer></script>
+    <script src="{{ url_for('static', filename='simulation.js') }}" defer></script>
   </head>
   <body>
     <div class="app-shell">
@@ -56,7 +59,7 @@
             <span class="mode-entry-copy">
               <small>CAMERA · POSE + HAND</small>
               <strong>视频跟随</strong>
-              <span>先在首页连接从臂，再打开实时画面完成“中立姿势 → ARM”</span>
+              <span>连接相机后，完成“中立姿势 → ARM”</span>
             </span>
             <span class="mode-entry-arrow" aria-hidden="true">→</span>
           </button>
@@ -67,6 +70,11 @@
               <strong><span class="agent-entry-name">小助手</span>对话</strong>
               <span>文字或持续语音交流，让 Agent 编排安全动作</span>
             </span>
+            <span class="mode-entry-arrow" aria-hidden="true">→</span>
+          </button>
+          <button id="openSimulationButton" class="mode-entry-card simulation-entry-card" type="button">
+            <span class="mode-entry-icon" aria-hidden="true">◇</span>
+            <span class="mode-entry-copy"><small>MUJOCO · ACTION STUDIO</small><strong>六轴仿真与动作编辑</strong><span>主从臂示教录制、仿真回放与动作编排</span></span>
             <span class="mode-entry-arrow" aria-hidden="true">→</span>
           </button>
         </section>
@@ -87,15 +95,25 @@
                 <p class="section-kicker">CAMERA · POSE + HAND</p>
                 <h2>实时人体与手部姿态</h2>
               </div>
-              <span id="previewBadge" class="badge badge-muted">STARTING</span>
+              <span id="previewBadge" class="badge badge-muted">未连接</span>
             </div>
 
+            <form id="cameraForm" class="camera-connection">
+              <label class="camera-name-field" for="cameraName">
+                相机名称
+                <input id="cameraName" name="cameraName" type="text" list="cameraDevices"
+                  placeholder="例如 Integrated Camera" autocomplete="off" maxlength="256" disabled>
+                <datalist id="cameraDevices"></datalist>
+              </label>
+              <button id="cameraConnectButton" class="button button-secondary" type="submit" disabled>连接视频</button>
+              <button id="cameraDisconnectButton" class="button button-danger-outline" type="button" disabled>断开视频</button>
+              <p id="cameraStatus" class="camera-status" role="status">填写设备管理器中的相机名称，留空使用默认相机。</p>
+            </form>
+
             <div class="video-stage">
-              <img id="videoFeed" src="/video_feed" alt="摄像头人体与手部姿态识别画面">
-              <div id="videoFallback" class="video-fallback" hidden>
-                <span class="fallback-icon" aria-hidden="true">×</span>
-                <strong>暂时没有视频画面</strong>
-                <small>请检查相机、MediaPipe 依赖和后台状态</small>
+              <img id="videoFeed" alt="摄像头人体与手部姿态识别画面" hidden>
+              <div id="videoFallback" class="video-fallback">
+                <strong id="videoFallbackTitle">相机未连接</strong>
               </div>
               <div class="video-overlay">
                 <span><i id="poseDot" class="signal-dot"></i><b id="poseSummary">等待人体与右手</b></span>
@@ -130,7 +148,7 @@
                   </div>
                   <span class="mode-pill vision-mode-pill">需中立姿势</span>
                 </div>
-                <p class="video-follow-hint">请先在首页连接从臂；已连接可直接从“采集中立姿势”开始。</p>
+                <p class="video-follow-hint">连接相机和从臂后，从“采集中立姿势”开始。</p>
                 <ol id="videoFollowSteps" class="control-sequence video-follow-steps"></ol>
                 <div id="videoStopSlot">
                   <button id="videoDialogStopButton" class="stop-button" type="button" disabled>
@@ -163,12 +181,12 @@
                   <h2 id="agentPanelTitle"><span id="agentDisplayName">小助手</span> 的对话</h2>
                 </div>
               </div>
-              <span id="agentStatusBadge" class="badge badge-muted">未配置</span>
+              <span id="agentStatusBadge" class="badge badge-muted">本地指令可用</span>
             </div>
 
             <div id="agentSetupNotice" class="agent-setup-notice">
-              <strong>先完成 Agent 设置</strong>
-              <span>填写云端模型地址、模型名称和 API Key 后，即可文字或语音对话。</span>
+              <strong>云端对话尚未配置</strong>
+              <span>可以直接说“打开夹爪”“点头两次”等内置指令。自由对话和自定义动作请先配置云端模型。</span>
               <button id="noticeSettingsButton" class="link-button" type="button">打开设置</button>
             </div>
 
@@ -179,7 +197,7 @@
                 <div class="message-avatar" aria-hidden="true">♡</div>
                 <div class="message-bubble">
                   <strong class="chat-speaker">小助手</strong>
-                  <p>你好呀！设置好云端模型后，可以点“开始语音 Agent”和我说话。</p>
+                  <p>你好呀！可以输入文字，或者点“开始语音 Agent”和我说话。</p>
                 </div>
               </article>
             </div>
@@ -194,6 +212,24 @@
               <input id="agentTextInput" type="text" maxlength="500" autocomplete="off" placeholder="输入一句话，例如：你好，或者摸摸头">
               <button id="sendAgentMessageButton" class="button button-agent" type="submit">发送</button>
             </form>
+            <div class="agent-speech-options">
+              <label class="form-field" for="agentSpeechLanguage">
+                <span>对话语言</span>
+                <select id="agentSpeechLanguage"><option value="zh">中文</option><option value="en">English</option></select>
+              </label>
+              <label class="form-field" for="agentChatVoice">
+                <span>音色</span>
+                <select id="agentChatVoice">
+                  <option value="taiwan_female">台妹女声 · 晓雨</option>
+                  <option value="puppy_male">小奶狗男声 · 云希</option>
+                  <option value="system_auto">本机语音</option>
+                </select>
+              </label>
+              <label class="form-field" for="agentSpeechRate">
+                <span>语音速度</span>
+                <select id="agentSpeechRate"><option value="0.8">0.8× 舒缓</option><option value="1">1× 正常</option><option value="1.25">1.25× 稍快</option><option value="1.5" selected>1.5× 快速</option><option value="1.75">1.75× 更快</option><option value="2">2× 很快</option></select>
+              </label>
+            </div>
 
             <div class="voice-controls">
               <button id="voiceToggleButton" class="voice-toggle-button" type="button" aria-pressed="false">
@@ -244,11 +280,13 @@
                     <span id="robotIdentity">等待配置…</span>
                     <span class="path-note">连接成功后，Agent 对话动作立即可用；下面的中立姿势仅用于人体视觉跟随。</span>
                   </div>
-                  <button id="connectButton" class="button button-secondary" type="button" disabled>
-                    连接机器人
-                  </button>
+                  <div class="follower-connection">
+                    <label for="followerPort">从臂串口</label>
+                    <input id="followerPort" type="text" placeholder="例如 COM4" maxlength="32" autocomplete="off" spellcheck="false" disabled>
+                    <button id="connectButton" class="button button-secondary" type="button" disabled>连接机器人</button>
+                  </div>
                   <small id="safeRangeTestNotice" class="progress-label" hidden>
-                    测试模式：跳过固定位置与60秒范围采集；ID1–ID2固定在连接位置，ID3–ID6使用配置安全限制
+                    Agent 动作可使用六轴；视频跟随仍固定 ID1–ID2。六轴调节与动作编排请打开“六轴仿真与动作编辑”。
                   </small>
                 </div>
               </li>
@@ -407,7 +445,7 @@
               <h2>六个舵机状态</h2>
             </div>
             <div class="legend" aria-label="舵机角色图例">
-              <span><i class="legend-dot fixed"></i>ID1–2 固定</span>
+              <span><i class="legend-dot fixed"></i>视频跟随：ID1–2 固定</span>
               <span><i class="legend-dot moving"></i>ID3–6 跟随</span>
             </div>
           </div>
@@ -432,7 +470,7 @@
             </table>
           </div>
           <p class="table-note">
-            位置值不是角度：ID1–ID5 约为 -100～100，ID6 为 0～100。ID1–2 始终保持已确认的固定值；
+            位置值不是角度：ID1–ID5 约为 -100～100，ID6 为 0～100。Agent 可使用六轴，视频跟随保持 ID1–2 固定；
             ID3–6 只会在采集并保存的安全范围内独立跟随。范围采集不会改写 LeRobot 舵机 EEPROM 校准。
           </p>
           </section>
@@ -480,10 +518,13 @@
           <label class="form-field">
             <span>语音</span>
             <select id="agentVoiceSelect" name="voice">
-              <option value="taiwan_female">台妹女声 · 台湾晓臻</option>
-              <option value="puppy_male">小奶狗男声 · 年轻清朗云希</option>
+              <option value="taiwan_female">台妹女声 · 晓雨</option>
+              <option value="puppy_male">小奶狗男声 · 云希</option>
               <option value="system_auto">本机中文语音（离线）</option>
             </select>
+          </label>
+          <label class="form-field"><span>语音速度</span>
+            <select id="agentSettingsSpeechRate"><option value="0.8">0.8× 舒缓</option><option value="1">1× 正常</option><option value="1.25">1.25× 稍快</option><option value="1.5" selected>1.5× 快速</option><option value="1.75">1.75× 更快</option><option value="2">2× 很快</option></select>
           </label>
           <div class="form-field form-field-wide">
             <button id="previewAgentVoiceButton" class="button button-secondary" type="button">试听所选音色</button>
@@ -507,6 +548,159 @@
           <button id="saveAgentSettingsButton" class="button button-agent" type="submit">保存设置</button>
         </div>
       </form>
+    </dialog>
+    <dialog id="simulationDialog" class="mode-dialog simulation-dialog" aria-labelledby="simulationTitle">
+      <div class="mode-dialog-shell">
+        <header class="mode-dialog-header"><div><p class="section-kicker">MUJOCO · ACTION STUDIO</p><h2 id="simulationTitle">六轴仿真与动作编辑</h2></div><button id="closeSimulationButton" class="dialog-close" type="button" aria-label="关闭仿真">×</button></header>
+        <p id="simulationMessage" class="simulation-message" role="status">打开后加载本地 MuJoCo 模型。</p>
+        <details class="simulation-teaching">
+          <summary>主从臂示教录制</summary>
+          <div class="simulation-teaching-content">
+            <div class="simulation-teaching-ports">
+              <section>
+                <h3>主臂</h3>
+                <label for="teachLeaderPort">主臂串口</label>
+                <input id="teachLeaderPort" type="text" placeholder="例如 COM5" maxlength="32" autocomplete="off" spellcheck="false">
+                <p class="simulation-note">已有有效校准可直接录制。首次校准时，托住机械臂，确定六轴中位后逐轴缓慢移动，采集各轴的安全行程。</p>
+                <div class="simulation-teaching-buttons">
+                  <button type="button" class="button button-secondary" data-teach-command="calibration/start" disabled>开始主臂校准</button>
+                  <button type="button" class="button button-secondary" data-teach-command="calibration/middle" disabled>确定六轴中位</button>
+                  <button type="button" class="button button-secondary" data-teach-command="calibration/range" disabled>采集六轴范围</button>
+                  <button type="button" class="button button-secondary" data-teach-command="calibration/save" disabled>保存主臂校准</button>
+                  <button type="button" class="button button-secondary" data-teach-command="calibration/cancel" disabled>取消主臂校准</button>
+                </div>
+                <p id="teachLeaderStatus" class="simulation-note" role="status"></p>
+              </section>
+              <section>
+                <h3>从臂</h3>
+                <label for="teachFollowerPort">从臂串口</label>
+                <input id="teachFollowerPort" type="text" placeholder="例如 COM4" maxlength="32" autocomplete="off" spellcheck="false" disabled>
+                <button type="button" class="button button-secondary" data-follower-command="connect" disabled>连接从臂</button>
+                <details class="simulation-follower-calibration">
+                  <summary>从臂基础校准</summary>
+                  <p class="simulation-note">连接校准不匹配时，托住从臂，释放六轴扭矩后依次确定中位和各轴范围。</p>
+                  <div class="simulation-teaching-buttons">
+                    <button type="button" class="button button-secondary" data-follower-command="calibration/start" disabled>释放六轴扭矩</button>
+                    <button type="button" class="button button-secondary" data-follower-command="calibration/middle" disabled>确定六轴中位</button>
+                    <button type="button" class="button button-secondary" data-follower-command="calibration/range" disabled>采集六轴范围</button>
+                    <button type="button" class="button button-secondary" data-follower-command="calibration/save" disabled>保存从臂校准</button>
+                    <button type="button" class="button button-secondary" data-follower-command="calibration/cancel" disabled>取消从臂校准</button>
+                  </div>
+                  <p id="teachFollowerCalibrationStatus" class="simulation-note" role="status"></p>
+                </details>
+                <p id="teachFollowerStatus" class="simulation-note" role="status"></p>
+              </section>
+            </div>
+            <div class="simulation-teaching-record">
+              <label for="teachRecordingMode">录制模式</label>
+              <select id="teachRecordingMode">
+                <option value="leader">只录主臂</option>
+                <option value="sync">从臂同步跟随</option>
+              </select>
+              <div class="simulation-action-fields">
+                <label for="teachRecordingName">动作名称
+                  <input id="teachRecordingName" type="text" maxlength="40" placeholder="例如 开心招呼" required>
+                </label>
+                <label for="teachRecordingDescription">动作介绍
+                  <textarea id="teachRecordingDescription" rows="2" maxlength="240" placeholder="例如 见面时抬起机械臂，摆动腕部打招呼" required></textarea>
+                </label>
+              </div>
+              <fieldset id="teachSyncCheck" class="simulation-sync-check" hidden>
+                <legend>同步跟随会驱动真机</legend>
+                <div id="teachSyncDirections" class="simulation-sync-directions"></div>
+                <label><input id="teachSyncConfirmed" type="checkbox">已核对六轴对应、旋转和夹爪开合方向，周围留有空间</label>
+              </fieldset>
+              <div class="simulation-teaching-buttons">
+                <button id="teachStartRecording" type="button" class="button button-agent" disabled>开始录制</button>
+                <button id="teachStopRecording" type="button" class="button button-danger-outline" disabled>停止录制</button>
+                <button id="teachExtractRecording" type="button" class="button button-secondary" disabled>生成动作草稿</button>
+              </div>
+              <p id="teachRecordingStatus" class="simulation-note" role="status">等待后台状态。</p>
+            </div>
+            <div class="simulation-teaching-table" tabindex="0" aria-label="六轴校准与录制范围">
+              <table>
+                <thead><tr><th scope="col">关节</th><th scope="col">主臂校准原始值</th><th scope="col">从臂校准原始值</th><th scope="col">编排允许范围</th><th scope="col">录制实际范围</th></tr></thead>
+                <tbody id="teachJointRanges"></tbody>
+              </table>
+            </div>
+          </div>
+        </details>
+        <div class="simulation-layout">
+          <section class="simulation-view-panel">
+            <div class="simulation-view"><img id="simulationFrame" alt="SO-101 MuJoCo 实时物理仿真画面"><span id="simulationFrameHint">正在准备仿真画面…</span></div>
+            <div class="simulation-toolbar"><button id="simulationPreviewButton" class="button button-agent" type="button">预览编排</button><button id="simulationPauseButton" class="button button-secondary" type="button">暂停仿真</button><button id="simulationResetButton" class="button button-secondary" type="button">重置仿真</button><span id="simulationProgress">0.0 / 0.0 秒</span></div>
+            <div class="simulation-recording-picker">
+              <div class="simulation-recording-controls">
+                <label for="simulationSavedRecordings">原始录制
+                  <select id="simulationSavedRecordings" disabled><option value="">暂无原始录制</option></select>
+                </label>
+                <button id="simulationPreviewRecordingButton" class="button button-secondary" type="button" disabled>回放原始录制</button>
+              </div>
+              <div class="simulation-toolbar">
+                <button id="simulationPreviewFollowerButton" class="button button-secondary" type="button" disabled>预览从臂轨迹</button>
+                <button id="simulationExecuteFollowerButton" class="button button-danger-outline" type="button" disabled>真机连续回放</button>
+              </div>
+              <p id="simulationFollowerRecordingNote" class="simulation-note" hidden></p>
+              <p id="simulationRecordingDescription" class="simulation-note" hidden></p>
+            </div>
+            <div class="simulation-camera"><label>观察方向 <input id="simulationAzimuth" type="range" min="-180" max="180" value="140"></label><label>观察距离 <input id="simulationDistance" type="range" min="0.35" max="1.5" step="0.05" value="0.85"></label><span id="simulationContacts">接触点：0</span></div>
+            <p class="simulation-note">编辑值为 LeRobot 归一化位置；模型角度为弧度换算。零点、方向和真机映射仍需核对，仿真结果不等于真机避障验证。</p>
+          </section>
+          <section class="simulation-editor-panel">
+            <details class="simulation-joint-settings" open>
+              <summary class="simulation-joint-summary">
+                <span>六个关节</span>
+                <span class="simulation-joint-summary-note">滑块只改变仿真</span>
+              </summary>
+              <div class="simulation-step-settings">
+                <label>执行方式<select id="simulationCaptureMode"><option value="parallel">同时运动</option><option value="sequential">依次运动</option></select></label>
+                <label>各轴运动合计<output id="simulationMoveTime">—</output></label>
+                <label>各轴停留合计<output id="simulationHoldTime">—</output></label>
+                <label>本步预计耗时<output id="simulationStepTime">—</output></label>
+              </div>
+              <p class="simulation-note simulation-axis-help">选择顺序 1、2、3 即切换为依次运动。每轴可设置运动和停留时间，起点留空沿用已有位置。预计耗时含移到起点的时间。</p>
+              <div id="simulationJointControls" class="simulation-joints" role="region" tabindex="0" aria-label="六轴舵机参数"></div>
+              <p class="simulation-note">勾选“固定”可从本步骤移除该关节。</p>
+            </details>
+            <p id="simulationHardwareState" class="simulation-note">真机状态将在打开时读取。</p>
+            <button id="simulationStopHardwareButton" class="button button-danger-outline" type="button">立即停止真机动作</button>
+            <div class="simulation-capture">
+              <button id="simulationCaptureButton" class="button button-agent" type="button">添加动作步骤</button>
+              <button id="simulationCancelEditButton" class="button button-secondary" type="button" hidden>取消步骤编辑</button>
+            </div>
+          </section>
+        </div>
+        <section class="simulation-sequence-panel">
+          <div class="simulation-section-heading"><h3>动作编排</h3><label><input id="simulationReturnToStart" type="checkbox" checked>完成后回到动作前的位置</label></div>
+          <div class="simulation-step-settings">
+            <label>编排类型
+              <select id="simulationActionKind"><option value="keyframes">关节步骤</option><option value="composition">组合已保存动作</option></select>
+            </label>
+          </div>
+          <p id="simulationKeyframeHelp" class="simulation-note simulation-sequence-help">步骤从上往下执行。每轴可运动 0.1～10 秒、停留 0～10 秒，整段最多 32 步、120 秒。真机受限速保护影响，可能耗时更长。</p>
+          <p id="simulationActionTime" class="simulation-action-time">整套动作预计耗时 —</p>
+          <ol id="simulationKeyframes" class="simulation-keyframes"><li class="simulation-empty">设好关节起点、终点和顺序后，点击“添加动作步骤”。</li></ol>
+          <div id="simulationCompositionEditor" hidden>
+            <div class="simulation-save-controls">
+              <select id="simulationCompositionSource" aria-label="选择要加入组合的动作"><option value="">选择已保存动作</option></select>
+              <button id="simulationCompositionAdd" class="button button-agent" type="button" disabled>加入组合</button>
+            </div>
+            <p class="simulation-note simulation-sequence-help">按列表顺序执行。每次播放后可停留，整套组合结束后按上方选项回位。</p>
+            <ol id="simulationCompositionItems" class="simulation-keyframes"></ol>
+          </div>
+          <div class="simulation-action-fields">
+            <label for="simulationActionName">动作名称
+              <input id="simulationActionName" type="text" maxlength="40" placeholder="例如 开心招呼" required>
+            </label>
+            <label for="simulationActionDescription">动作介绍
+              <textarea id="simulationActionDescription" rows="2" maxlength="240" placeholder="描述动作内容和适用场景，供 Agent 选择动作时参考" required></textarea>
+            </label>
+          </div>
+          <div class="simulation-save-controls"><button id="simulationSaveButton" class="button button-agent" type="button">保存动作</button><button id="simulationNewButton" class="button button-secondary" type="button">新建动作</button><select id="simulationSavedActions" aria-label="选择已保存动作"><option value="">选择已保存的动作</option></select><button id="simulationLoadButton" class="button button-secondary" type="button" disabled>载入修改</button><button id="simulationDeleteButton" class="button button-danger-outline" type="button" disabled>删除动作</button><button id="simulationExecuteButton" class="button button-danger-outline" type="button" disabled>真机试运行此动作</button></div>
+          <p id="simulationTrialStatus" class="simulation-trial-status" role="status" hidden></p>
+          <p class="simulation-note">“预览编排”只运行仿真。每关节的“真机移动”和“真机试运行此动作”会控制已连接的机械臂，仍受本地限位、限速和停止控制约束。</p>
+        </section>
+      </div>
     </dialog>
   </body>
 </html>

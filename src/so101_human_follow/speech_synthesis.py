@@ -8,6 +8,8 @@ import time
 from collections import OrderedDict
 from dataclasses import dataclass
 
+from .speech_normalizer import normalize_language
+
 
 LOGGER = logging.getLogger("so101_human_follow.speech")
 MAX_SPEECH_CHARACTERS = 600
@@ -31,6 +33,10 @@ VOICE_PRESETS = {
     # pace/pitch; artificially speeding up every sentence flattens its pauses.
     "taiwan_female": VoicePreset("zh-TW-HsiaoYuNeural"),
     "puppy_male": VoicePreset("zh-CN-YunxiNeural", rate="+8%", pitch="+2Hz"),
+}
+ENGLISH_VOICE_PRESETS = {
+    "taiwan_female": VoicePreset("en-US-AriaNeural"),
+    "puppy_male": VoicePreset("en-US-GuyNeural", rate="+8%", pitch="+2Hz"),
 }
 
 
@@ -70,10 +76,38 @@ class SpeechSynthesizer:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._cache: OrderedDict[tuple[str, str], tuple[float, bytes]] = OrderedDict()
+        self._state_lock = threading.Lock()
+        self._generation = 0
+        self._active_loop = None
+        self._active_task = None
+        self._cache: OrderedDict[tuple[str, str, str], tuple[float, bytes]] = OrderedDict()
         self._cache_bytes = 0
 
-    def synthesize(self, text: str, voice: str) -> bytes:
+    def cancel_current(self) -> None:
+        """Release an interrupted synthesis instead of making new speech wait."""
+        with self._state_lock:
+            self._generation += 1
+            loop, task = self._active_loop, self._active_task
+        if loop is not None and task is not None:
+            try:
+                loop.call_soon_threadsafe(task.cancel)
+            except RuntimeError:
+                pass  # The old event loop already finished.
+
+    async def _run_cancellable(self, text: str, preset: VoicePreset, generation: int) -> bytes:
+        loop, task = asyncio.get_running_loop(), asyncio.current_task()
+        with self._state_lock:
+            if generation != self._generation:
+                raise asyncio.CancelledError()
+            self._active_loop, self._active_task = loop, task
+        try:
+            return await asyncio.wait_for(self._collect_audio(text, preset), SYNTHESIS_TIMEOUT_S)
+        finally:
+            with self._state_lock:
+                if self._active_task is task:
+                    self._active_loop = self._active_task = None
+
+    def synthesize(self, text: str, voice: str, language: str = "zh") -> bytes:
         if not isinstance(text, str):
             raise ValueError("语音文本必须是字符串。")
         text = text.strip()
@@ -81,20 +115,24 @@ class SpeechSynthesizer:
             raise ValueError(f"语音文本需要1到{MAX_SPEECH_CHARACTERS}个字符。")
         if any(ord(char) < 32 and char not in "\r\n\t" for char in text):
             raise ValueError("语音文本包含不支持的控制字符。")
-        if not isinstance(voice, str) or voice not in VOICE_PRESETS:
-            raise ValueError("请选择台湾女生或年轻柔和男声。")
+        language = normalize_language(language)
+        presets = ENGLISH_VOICE_PRESETS if language == "en" else VOICE_PRESETS
+        if not isinstance(voice, str) or voice not in presets:
+            raise ValueError("请选择女生或年轻柔和男声。")
         text = _spoken_text(text)
         if not text:
             raise ValueError("语音文本需要包含可朗读的内容。")
-        preset = VOICE_PRESETS[voice]
+        preset = presets[voice]
         # A second request fails promptly instead of building an unbounded queue
         # and playing stale speech after the operator has already moved on.
         if not self._lock.acquire(blocking=False):
             raise SpeechBusyError("语音正在生成，请稍后重试。")
         started = time.monotonic()
+        with self._state_lock:
+            generation = self._generation
         try:
             self._expire_cache(started)
-            cache_key = (voice, text)
+            cache_key = (language, voice, text)
             cached = self._cache.get(cache_key)
             if cached is not None:
                 self._cache.move_to_end(cache_key)
@@ -105,8 +143,11 @@ class SpeechSynthesizer:
                 return cached[1]
             try:
                 audio = asyncio.run(
-                    asyncio.wait_for(self._collect_audio(text, preset), SYNTHESIS_TIMEOUT_S)
+                    self._run_cancellable(text, preset, generation)
                 )
+            except asyncio.CancelledError as exc:
+                LOGGER.info("speech synthesis cancelled | voice=%s", voice)
+                raise SpeechSynthesisError("旧语音已因插话取消。") from exc
             except ImportError as exc:
                 LOGGER.warning("speech synthesis unavailable | dependency=edge-tts")
                 raise SpeechUnavailableError("自然语音组件尚未安装，请安装项目的 web 依赖。") from exc

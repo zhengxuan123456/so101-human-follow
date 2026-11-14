@@ -21,7 +21,7 @@ if not exist "%SO101_PROJECT%config.json" (
   exit /b 1
 )
 
-echo [WARNING] 此模式允许网页连接 COM4。
+echo [WARNING] 此模式允许网页连接你填写的主臂和从臂串口。
 echo 启动服务本身不会连接机器人；仍需在网页点击“连接机器人”。
 echo 请清空机械臂活动范围，并确保实体电源开关触手可及。
 choice /C YN /N /M "继续启动？[Y/N] "

@@ -35,7 +35,7 @@ class ConnectedRobot:
 
 class RobotAdapterCleanupTest(unittest.TestCase):
     def setUp(self):
-        settings = load_config("config.json").robot
+        settings = load_config("config.example.json").robot
         self.adapter = SO101RobotAdapter(settings)
 
     def test_partial_bus_connection_is_cleaned(self):

@@ -3,12 +3,17 @@
 
   const THEME_KEY = "so101-agent-theme";
   const VOICE_KEY = "so101-agent-voice";
+  const LANGUAGE_KEY = "so101-agent-language";
+  const SPEECH_RATE_KEY = "so101-agent-speech-rate";
   const PREFERENCES_KEY = "so101-agent-preferences";
-  const CLIENT_KEY = "so101-human-follow-client-id";
   const AGENT_POLL_MS = 1000;
   const DEFAULT_VOICE = "taiwan_female";
-  const MOTION_BUSY_HINT = "上个动作仍在执行或回位，请完成后再发送，或先停止。";
+  const MOTION_BUSY_HINT = "可直接输入或说话插话；新内容会结合未完成动作重新安排。";
   const NEURAL_VOICES = new Set(["taiwan_female", "puppy_male"]);
+  const VOICE_LABELS = {
+    zh: ["台妹女声 · 晓雨", "小奶狗男声 · 云希", "本机中文语音"],
+    en: ["英语女声 · Aria", "英语男声 · Guy", "本机英语语音"],
+  };
   const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
 
   const elements = {
@@ -37,6 +42,10 @@
     apiKeyInput: byId("agentApiKeyInput"),
     modelInput: byId("agentModelInput"),
     voiceSelect: byId("agentVoiceSelect"),
+    chatVoiceSelect: byId("agentChatVoice"),
+    speechLanguageSelect: byId("agentSpeechLanguage"),
+    speechRateSelect: byId("agentSpeechRate"),
+    settingsSpeechRateSelect: byId("agentSettingsSpeechRate"),
     previewVoiceButton: byId("previewAgentVoiceButton"),
     replaySpeechButton: byId("replaySpeechButton"),
     speechPlaybackMessage: byId("speechPlaybackMessage"),
@@ -70,20 +79,47 @@
   let remoteMotion = null;
   let localAgentError = "";
   let interactionGeneration = 0;
+  let messageController = null;
+  let voicePreempted = false;
+  let voicePreemptPromise = null;
+  let assistantSpokenText = "";
+  let assistantSpeechEndedAt = 0;
+  let assistantAudioPlaying = false;
+  let voiceInterimTimer = null;
+  let speechRate = 1.5;
+  let speechLanguage = "zh";
+  let voicePreference = DEFAULT_VOICE;
+  let reportActiveAudioClock = null;
+  let activeSystemUtterance = null;
+  Object.defineProperty(window, "so101InteractionSequence", { get: () => interactionGeneration });
+  Object.defineProperty(window, "so101InvalidateInteraction", { value: invalidateInteraction });
   let readyTaskId = null;
   let speechGeneration = 0;
   let speechController = null;
   let speechFinish = null;
   let activeAudio = null;
   let activeAudioUrl = null;
+  let playbackClockCleanup = null;
   let replaySpeech = null;
 
   function byId(id) {
     return document.getElementById(id);
   }
 
+  function storedPreference(key) {
+    try { return localStorage.getItem(key) || ""; } catch (_error) { return ""; }
+  }
+
+  function storePreference(key, value) {
+    try { localStorage.setItem(key, value); } catch (_error) { /* optional */ }
+  }
+
   function getClientId() {
-    return sessionStorage.getItem(CLIENT_KEY) || "agent-ui";
+    const id = window.so101ControlClientId;
+    if (typeof id !== "string" || !/^[A-Za-z0-9_-]{16,96}$/.test(id)) {
+      throw new Error("网页控制标识未初始化，请刷新页面后重试。");
+    }
+    return id;
   }
 
   async function api(path, options = {}) {
@@ -126,15 +162,63 @@
   }
 
   function updateSendButton() {
-    elements.sendButton.disabled = agentBusy;
-    elements.sendButton.textContent = agentBusy ? "处理中" : remoteMotion?.active ? "动作进行中" : "发送";
-    elements.sendButton.title = remoteMotion?.active ? `${MOTION_BUSY_HINT}仍可输入“停止”。` : "";
+    elements.sendButton.disabled = false;
+    elements.sendButton.textContent = agentBusy || speaking || remoteMotion?.active ? "插话" : "发送";
+    elements.sendButton.title = MOTION_BUSY_HINT;
+  }
+
+  function setSpeechRate(value, persist = true) {
+    const parsed = Number(value);
+    speechRate = Number.isFinite(parsed) ? Math.max(0.8, Math.min(2, parsed)) : 1.5;
+    for (const control of [elements.speechRateSelect, elements.settingsSpeechRateSelect]) {
+      if (control) control.value = String(speechRate);
+    }
+    if (persist) {
+      try { localStorage.setItem(SPEECH_RATE_KEY, String(speechRate)); } catch (_error) { /* optional */ }
+    }
+    if (activeAudio) {
+      activeAudio.playbackRate = speechRate;
+      activeAudio.preservesPitch = true;
+      reportActiveAudioClock?.();
+    }
+    if (activeSystemUtterance) {
+      // The browser does not reliably apply a rate change mid-utterance.
+      elements.speechPlaybackMessage.textContent = "语速已更新；本机语音将在下一句使用新语速。";
+    }
+  }
+
+  function speechLocale(language) {
+    return language === "en" ? "en-US" : "zh-CN";
+  }
+
+  function setSpeechLanguage(value, persist = true) {
+    const language = value === "en" ? "en" : "zh";
+    const changed = language !== speechLanguage;
+    speechLanguage = language;
+    if (elements.speechLanguageSelect) elements.speechLanguageSelect.value = language;
+    elements.textInput.placeholder = language === "en"
+      ? "Type a message, for example: hello or wave"
+      : "输入一句话，例如：你好，或者摸摸头";
+    if (persist) storePreference(LANGUAGE_KEY, language);
+    populateVoices();
+    if (changed && recognition) {
+      window.clearTimeout(voiceInterimTimer);
+      voiceInterimTimer = null;
+      recognition.onend = null;
+      recognition.onstart = null;
+      recognition.onresult = null;
+      recognition.onerror = null;
+      try { recognition.abort(); } catch (_error) { /* already ending */ }
+      recognitionRunning = false;
+      recognition = createRecognition();
+      scheduleRecognitionRestart();
+    }
   }
 
   function setAgentState(state, detail = "") {
     lastAgentState = state || "idle";
     const states = {
-      idle: [settingsConfigured ? "待命" : "未配置", settingsConfigured ? "safe" : "muted", "等待你的指令"],
+      idle: [settingsConfigured ? "待命" : "本地指令可用", settingsConfigured ? "safe" : "muted", "等待你的指令"],
       listening: ["正在监听", "armed", "正在听你说话…"],
       transcribing: ["正在识别", "warning", "正在整理语音文字…"],
       thinking: ["正在思考", "warning", "正在理解并生成安全动作…"],
@@ -142,7 +226,7 @@
       preparing_speech: ["准备语音", "warning", "正在生成自然语音，准备好后开始播放"],
       awaiting_play: ["点击播放", "warning", "浏览器暂未允许自动播放，请点击下方播放按钮"],
       executing: ["正在执行", "warning", "正在执行已通过安全检查的动作"],
-      returning: ["正在回位", "warning", "正在回到本次动作前的位置，可随时停止"],
+      returning: ["正在回位", "warning", "正在移动到回位目标，可随时停止"],
       waiting_visual: ["等待画面", "warning", "动作已安排，等待摄像头识别到可靠的肩部或手掌…"],
       paused_visual: ["动作已暂停", "warning", "肩部或手掌暂时丢失，正在等待画面恢复…"],
       complete: ["动作流程结束", "safe", "本次动作流程已结束"],
@@ -244,6 +328,7 @@
         saved[field] = value.trim();
       }
     }
+    if (["zh", "en"].includes(values?.language)) saved.language = values.language;
     return saved;
   }
 
@@ -262,6 +347,7 @@
     try {
       localStorage.setItem(PREFERENCES_KEY, JSON.stringify(saved));
       if (saved.voice) localStorage.setItem(VOICE_KEY, saved.voice);
+      if (saved.language) localStorage.setItem(LANGUAGE_KEY, saved.language);
     } catch (_error) {
       // Backend settings are already saved.  A blocked browser backup must not
       // turn that successful save into an error or retain the Key in the form.
@@ -280,10 +366,8 @@
     elements.baseUrlInput.value = settings.base_url || settings.api_base || saved.base_url || "";
     elements.modelInput.value = settings.model || saved.model || "";
     elements.apiKeyInput.value = "";
-    let legacyVoice = "";
-    try { legacyVoice = localStorage.getItem(VOICE_KEY) || ""; } catch (_error) { /* optional backup */ }
-    const selectedVoice = settings.voice || saved.voice || legacyVoice || DEFAULT_VOICE;
-    if (selectedVoice) elements.voiceSelect.value = selectedVoice;
+    voicePreference = storedPreference(VOICE_KEY) || settings.voice || saved.voice || DEFAULT_VOICE;
+    setSpeechLanguage(storedPreference(LANGUAGE_KEY) || settings.language || saved.language, false);
     elements.agentSetupNotice.hidden = configured;
     if (!agentBusy && !speaking && !voiceEnabled) setAgentState("idle");
   }
@@ -304,6 +388,7 @@
       base_url: elements.baseUrlInput.value.trim(),
       model: elements.modelInput.value.trim(),
       voice: elements.voiceSelect.value,
+      language: speechLanguage,
     };
     const apiKey = elements.apiKeyInput.value.trim();
     if (apiKey) payload.api_key = apiKey;
@@ -345,6 +430,7 @@
         base_url: savedSettings.base_url || payload.base_url,
         model: savedSettings.model || payload.model,
         voice: savedSettings.voice || payload.voice,
+        language: savedSettings.language || payload.language,
       });
       applySettings(result.settings ? result : { ...payload, configured: true });
       settingsConfigured = true;
@@ -393,10 +479,11 @@
   }
 
   function isLocalStopCommand(text) {
-    const cleaned = String(text || "")
-      .replace(/[，。！？!?,.\s]/g, "")
-      .replace(new RegExp(`^${escapeRegExp(agentName)}`), "");
-    return /^(停止|停下|别动|不要动|马上停止|紧急停止|急停)$/.test(cleaned);
+    const cleaned = String(text || "").trim()
+      .replace(new RegExp(`^${escapeRegExp(agentName)}[，,\\s]*`, "i"), "");
+    const chinese = cleaned.replace(/[，。！？!?,.\s]/g, "");
+    return /^(停止|停下|别动|不要动|马上停止|紧急停止|急停)$/.test(chinese) ||
+      /^(?:please\s+)?(?:emergency\s+stop|stop(?:\s+moving)?|halt|freeze|(?:do\s+not|don['’]t)\s+move)(?:\s+now)?(?:[,\s]+please)?[.!?]*$/i.test(cleaned);
   }
 
   function escapeRegExp(value) {
@@ -410,11 +497,14 @@
     localAgentError = "";
     clearStarterMessage();
     appendMessage("user", sourceText);
+    if (elements.textInput.value.trim() === sourceText) elements.textInput.value = "";
     setAgentState("executing", "识别到本地停止词，正在立即停止动作…");
     try {
-      const result = await api("/api/disarm", { method: "POST" });
+      await api("/api/disarm", {
+        method: "POST", body: JSON.stringify({ client_sequence: generation }),
+      });
       if (generation !== interactionGeneration) return;
-      const reply = result.message || "已经停止动作。";
+      const reply = speechLanguage === "en" ? "I've stopped the motion." : "已经停止动作。";
       appendMessage("assistant", reply, { meta: "本地停止指令 · 未调用云端模型" });
       await speakReply(reply);
     } catch (error) {
@@ -446,7 +536,7 @@
       return_to_action_start: "回到刚才的位置",
       open_gripper: "张开夹爪",
       close_gripper: "合上夹爪",
-      return_to_neutral: "返回起始姿势",
+      return_to_neutral: "返回连接时的位置",
       wait: "等待",
     };
     const responseLabels = {
@@ -472,6 +562,7 @@
       if (name === "perform_response_gesture") {
         return responseLabels[item.arguments?.category] || "通用回应并回位";
       }
+      if (name === "perform_custom_action") return "已保存的自定义动作";
       if (name === "perform_gesture") {
         const gesture = gestureLabels[item.arguments?.gesture] || "姿态回应";
         const count = Number(item.arguments?.count);
@@ -611,42 +702,40 @@
     });
   }
 
-  async function sendMessage(text, source = "text") {
+  async function sendMessage(text, source = "text", recognitionMs = null) {
     const cleanText = String(text || "").trim();
     if (!cleanText) return;
+    window.clearTimeout(voiceInterimTimer);
+    voiceInterimTimer = null;
     if (isLocalStopCommand(cleanText)) {
       await executeLocalStop(cleanText);
       return;
     }
-    if (agentBusy) return;
-    if (!settingsConfigured) {
-      setAgentState("error", "请先完成 Agent 设置并测试云端模型。 ");
-      openSettings();
-      return;
-    }
-
-    const generation = ++interactionGeneration;
+    const interrupt = Boolean(agentBusy || speaking || readyTaskId || remoteMotion?.active || voicePreempted);
+    const language = speechLanguage;
+    const voice = elements.voiceSelect.value || DEFAULT_VOICE;
+    const generation = voicePreempted ? interactionGeneration : ++interactionGeneration;
+    voicePreempted = false;
+    messageController?.abort();
+    stopSpeech();
+    readyTaskId = null;
+    const requestController = new AbortController();
+    messageController = requestController;
     let deferredTaskId = null;
     let motionDispatched = false;
+    let taskId = null;
+    const receivedAt = performance.now();
+    const timing = {};
+    if (recognitionMs !== null) timing.recognition_ms = recognitionMs;
     agentBusy = true;
     localAgentError = "";
-    // Keep continuous voice recognition alive while the cloud model is thinking
-    // so a local STOP word can still pre-empt the in-flight request.  Non-stop
-    // utterances are ignored by the agentBusy gate below; speech is paused later
-    // while the assistant is speaking to avoid recognizing its own reply.
     if (!voiceEnabled) pauseRecognition();
+    else startRecognition();
     updateSendButton();
 
     try {
-      // Speech can finish before the robot has returned. Check fresh physical
-      // motion state before clearing text or starting another cloud request.
-      await pollAgentStatus({ strict: true });
+      if (voicePreemptPromise) await voicePreemptPromise;
       if (generation !== interactionGeneration) return;
-      if (remoteMotion?.active) {
-        renderMotionStatus();
-        elements.voiceStateText.textContent = MOTION_BUSY_HINT;
-        return;
-      }
       clearStarterMessage();
       appendMessage("user", cleanText);
       elements.rawTranscript.textContent = cleanText;
@@ -654,10 +743,15 @@
       elements.textInput.value = "";
       elements.cancelAgentButton.disabled = false;
       setAgentState("thinking");
+      const requestStarted = performance.now();
       const payload = await api("/api/agent/message", {
         method: "POST",
-        body: JSON.stringify({ text: cleanText, source, defer_motion: true }),
+        signal: requestController.signal,
+        body: JSON.stringify({ text: cleanText, source, language, defer_motion: true, interrupt,
+          client_sequence: generation }),
       });
+      timing.plan_request_ms = performance.now() - requestStarted;
+      taskId = payload.task_id;
       if (generation !== interactionGeneration) return;
       elements.normalizedTranscript.textContent = extractNormalized(payload, cleanText);
       const state = String(payload.state || payload.status || "").toLowerCase();
@@ -673,27 +767,45 @@
         appendConfirmationControls(payload.task_id);
       }
       const scheduledMotion = payload.result?.agent_motion;
-      if (scheduledMotion) remoteMotion = { ...scheduledMotion, active: true };
+      if (scheduledMotion) {
+        remoteMotion = { ...scheduledMotion, active: true };
+        motionDispatched = true;
+        timing.motion_ack_ms = performance.now() - receivedAt;
+      }
       readyTaskId = state === "ready" ? payload.task_id : null;
       void pollAgentStatus();
       if (state.includes("execut")) setAgentState("executing");
       deferredTaskId = readyTaskId;
       await speakReply(reply, {
-        onPlaybackStart: deferredTaskId ? async (duration, signal) => {
+        language,
+        voice,
+        taskId,
+        timing,
+        receivedAt,
+        onPlaybackStart: deferredTaskId ? async (duration, signal, media) => {
           if (generation !== interactionGeneration || readyTaskId !== deferredTaskId) {
             throw new DOMException("Interaction cancelled", "AbortError");
           }
           const started = await api("/api/agent/start", {
             method: "POST",
             signal,
-            body: JSON.stringify({ task_id: deferredTaskId, speech_duration_s: duration }),
+            body: JSON.stringify({ task_id: deferredTaskId, speech_duration_s: duration, ...media }),
           });
           if (generation !== interactionGeneration) return;
           motionDispatched = true;
+          timing.motion_ack_ms = performance.now() - receivedAt;
           readyTaskId = null;
           const motion = started.result?.agent_motion || started.agent_motion;
           if (motion) remoteMotion = { ...motion, active: true };
           void pollAgentStatus();
+        } : null,
+        onPlaybackProgress: deferredTaskId ? async (progress, signal) => {
+          if (generation !== interactionGeneration || !motionDispatched) return;
+          return api("/api/agent/playback", {
+            method: "POST",
+            signal,
+            body: JSON.stringify({ task_id: deferredTaskId, ...progress }),
+          });
         } : null,
       });
     } catch (error) {
@@ -720,10 +832,19 @@
       }
       const reason = friendlyAgentError(error.message);
       localAgentError = reason;
-      appendMessage("assistant", `这次没有执行：${reason}`);
+      const playbackError = motionDispatched ? "动作已启动，语音播放遇到问题" : "这次没有执行";
+      appendMessage("assistant", `${playbackError}：${reason}`);
       setAgentState("error", reason);
+      if (!settingsConfigured && reason.includes("需要云端模型")) openSettings();
     } finally {
+      if (taskId) {
+        void api("/api/agent/latency", {
+          method: "POST",
+          body: JSON.stringify({ task_id: taskId, source, interrupted: generation !== interactionGeneration, ...timing }),
+        }).catch(() => {});
+      }
       if (generation === interactionGeneration) {
+        if (messageController === requestController) messageController = null;
         agentBusy = false;
         updateSendButton();
         elements.cancelAgentButton.disabled = !remoteMotion?.active && !readyTaskId;
@@ -738,7 +859,8 @@
     try {
       await api("/api/agent/cancel", {
         method: "POST",
-        body: JSON.stringify(pendingTaskId ? { task_id: pendingTaskId } : {}),
+        body: JSON.stringify({ ...(pendingTaskId ? { task_id: pendingTaskId } : {}),
+          client_sequence: interactionGeneration }),
       });
       localAgentError = "";
       remoteMotion = null;
@@ -755,46 +877,46 @@
 
   function populateVoices() {
     availableVoices = window.speechSynthesis?.getVoices() || [];
-    const current = localStorage.getItem(VOICE_KEY) || elements.voiceSelect.value || DEFAULT_VOICE;
-    elements.voiceSelect.replaceChildren(
-      new Option("台妹女声 · 晓雨（自然语速）", "taiwan_female"),
-      new Option("小奶狗男声 · 年轻清朗云希", "puppy_male"),
-      new Option("本机中文语音（离线）", "system_auto"),
-    );
-    const sorted = [...availableVoices].sort((a, b) => {
-      const aChinese = /^zh/i.test(a.lang) ? 0 : 1;
-      const bChinese = /^zh/i.test(b.lang) ? 0 : 1;
-      return aChinese - bChinese || a.name.localeCompare(b.name, "zh-CN");
-    });
-    for (const voice of sorted) {
-      elements.voiceSelect.add(new Option(`本机：${voice.name} (${voice.lang})`, voice.name));
-    }
-    if ([...elements.voiceSelect.options].some((option) => option.value === current)) {
-      elements.voiceSelect.value = current;
+    const [female, male, automatic] = VOICE_LABELS[speechLanguage];
+    const options = [[female, "taiwan_female"], [male, "puppy_male"], [automatic, "system_auto"]];
+    const matching = availableVoices.filter((voice) => voice.lang.toLowerCase().startsWith(speechLanguage));
+    matching.sort((a, b) => a.name.localeCompare(b.name, speechLocale(speechLanguage)));
+    for (const voice of matching) options.push([`本机 ${voice.name} (${voice.lang})`, voice.name]);
+    const current = options.some(([, value]) => value === voicePreference) ? voicePreference : DEFAULT_VOICE;
+    for (const control of [elements.voiceSelect, elements.chatVoiceSelect]) {
+      if (!control) continue;
+      control.replaceChildren(...options.map(([label, value]) => new Option(label, value)));
+      control.value = current;
     }
   }
 
-  function selectedVoice(preset) {
-    const selected = preset || elements.voiceSelect.value || localStorage.getItem(VOICE_KEY) || DEFAULT_VOICE;
-    if (selected === "taiwan_female") {
-      const taiwanVoice = availableVoices.find((voice) => /^zh(-|_)?TW/i.test(voice.lang));
-      if (taiwanVoice) return taiwanVoice;
-    }
-    if (selected === "puppy_male") {
-      const maleVoice = availableVoices.find((voice) => /^zh/i.test(voice.lang) &&
-        /yunxi|yunyang|yunjian|yunfeng|kangkang|云希|云扬|云健|康康/i.test(voice.name));
-      if (maleVoice) return maleVoice;
-    }
-    return availableVoices.find((voice) => voice.name === selected) ||
-      availableVoices.find((voice) => /^zh(-|_)?CN/i.test(voice.lang)) ||
-      availableVoices.find((voice) => /^zh/i.test(voice.lang)) || null;
+  function selectedVoice(preset, language) {
+    const matching = availableVoices.filter((voice) => voice.lang.toLowerCase().startsWith(language));
+    const preferredLocale = speechLocale(language).toLowerCase();
+    const locale = (voice) => voice.lang.toLowerCase().replace("_", "-");
+    const preferences = language === "en" ? {
+      taiwan_female: (voice) => /aria|jenny|zira|samantha/i.test(voice.name),
+      puppy_male: (voice) => /guy|david|mark|alex/i.test(voice.name),
+    } : {
+      taiwan_female: (voice) => locale(voice) === "zh-tw",
+      puppy_male: (voice) => /yunxi|yunyang|yunjian|yunfeng|kangkang|云希|云扬|云健|康康/i.test(voice.name),
+    };
+    return matching.find((voice) => voice.name === preset) ||
+      (NEURAL_VOICES.has(preset) && matching.find(preferences[preset])) ||
+      matching.find((voice) => locale(voice) === preferredLocale) || matching[0] || null;
   }
 
   function releaseAudio() {
+    playbackClockCleanup?.();
+    playbackClockCleanup = null;
+    reportActiveAudioClock = null;
     if (activeAudio) {
       activeAudio.onended = null;
       activeAudio.onerror = null;
       activeAudio.onplaying = null;
+      activeAudio.onpause = null;
+      activeAudio.onwaiting = null;
+      activeAudio.onstalled = null;
       activeAudio.pause();
       activeAudio.removeAttribute("src");
       activeAudio.load();
@@ -810,30 +932,44 @@
     speechController = null;
     releaseAudio();
     window.speechSynthesis?.cancel();
+    activeSystemUtterance = null;
     const finish = speechFinish;
     speechFinish = null;
     finish?.();
     speaking = false;
+    if (assistantAudioPlaying) assistantSpeechEndedAt = performance.now();
+    assistantAudioPlaying = false;
     replaySpeech = null;
     elements.replaySpeechButton.hidden = true;
   }
 
   function invalidateInteraction() {
     interactionGeneration += 1;
+    messageController?.abort();
+    messageController = null;
+    voicePreempted = false;
+    voicePreemptPromise = null;
+    window.clearTimeout(voiceInterimTimer);
+    voiceInterimTimer = null;
     readyTaskId = null;
     stopSpeech();
     agentBusy = false;
     updateSendButton();
+    return interactionGeneration;
   }
 
-  async function speakReply(text, { onPlaybackStart = null } = {}) {
+  async function speakReply(text, {
+    language = speechLanguage, voice = elements.voiceSelect.value || DEFAULT_VOICE,
+    onPlaybackStart = null, onPlaybackProgress = null,
+    taskId = null, timing = null, receivedAt = null,
+  } = {}) {
     const cleanText = String(text || "").trim();
     if (!cleanText) return;
     stopSpeech();
+    assistantSpokenText = cleanText;
     const generation = speechGeneration;
     const controller = new AbortController();
     speechController = controller;
-    const voice = elements.voiceSelect.value || localStorage.getItem(VOICE_KEY) || DEFAULT_VOICE;
     const isCurrent = () => generation === speechGeneration && !controller.signal.aborted;
     let startPromise = null;
     let playbackStarted = false;
@@ -852,23 +988,31 @@
       controller.abort();
       speechController = null;
       speaking = false;
+      if (assistantAudioPlaying) assistantSpeechEndedAt = performance.now();
+      assistantAudioPlaying = false;
+      activeSystemUtterance = null;
       replaySpeech = null;
       elements.replaySpeechButton.hidden = true;
       if (error) rejectCompletion(error);
       else resolveCompletion();
       if (!agentBusy) resumeListeningOrIdle();
     };
-    const durationEstimate = Math.max(0.5, Math.min(30, cleanText.length / 4.8));
-    const onActualStart = (duration) => {
+    const spokenSeconds = language === "en" ? cleanText.split(/\s+/).length / 2.5 : cleanText.length / 4.8;
+    const durationEstimate = Math.max(0.5, Math.min(30, spokenSeconds)) / speechRate;
+    const onActualStart = (duration, mediaDuration = null) => {
       if (!isCurrent() || playbackStarted) return;
+      if (timing) timing.audio_start_ms = performance.now() - receivedAt;
       playbackStarted = true;
+      assistantAudioPlaying = true;
       elements.replaySpeechButton.hidden = true;
       setAgentState("speaking");
       const seconds = Number.isFinite(duration) && duration > 0 ? duration : durationEstimate;
       startPromise = Promise.resolve()
         .then(() => {
           if (!isCurrent()) return;
-          return onPlaybackStart?.(seconds, controller.signal);
+          return onPlaybackStart?.(seconds, controller.signal, {
+            playback_rate: speechRate, media_duration_s: mediaDuration,
+          });
         })
         .catch((error) => {
           // Once playback has started, do not retry and launch the motion twice.
@@ -882,6 +1026,7 @@
     };
     const showPlayButton = (play) => {
       if (!isCurrent()) return;
+      if (timing) timing.autoplay_blocked = true;
       replaySpeech = play;
       elements.replaySpeechButton.textContent = onPlaybackStart ? "点击播放并开始动作" : "点击播放语音";
       elements.replaySpeechButton.hidden = false;
@@ -895,26 +1040,29 @@
       setAgentState("awaiting_play");
     };
 
-    pauseRecognition();
+    if (!voiceEnabled) pauseRecognition();
+    else startRecognition();
     speaking = true;
     elements.speechPlaybackMessage.textContent = "";
     setAgentState("preparing_speech");
 
     const playLocalVoice = (fallbackReason = "") => {
       if (!isCurrent()) return;
+      if (timing) timing.audio_mode = fallbackReason ? "system_fallback" : "system";
       if (!window.speechSynthesis || !window.SpeechSynthesisUtterance) {
-        finish(new Error("当前浏览器无法播放语音；本次动作没有启动，请更换浏览器重试。"));
+        finish(new Error("当前浏览器无法播放语音，请更换浏览器重试。"));
         return;
       }
-      const localVoice = selectedVoice(voice);
+      const localVoice = selectedVoice(voice, language);
       if (fallbackReason) {
         elements.speechPlaybackMessage.textContent = `自然音色暂时不可用，已切换本机语音${localVoice ? `（${localVoice.name}）` : ""}。`;
       }
       const utterance = new SpeechSynthesisUtterance(cleanText);
-      utterance.lang = localVoice?.lang || "zh-CN";
+      utterance.lang = localVoice?.lang || speechLocale(language);
       if (localVoice) utterance.voice = localVoice;
-      utterance.rate = voice === "taiwan_female" ? 1.0 : 1.08;
+      utterance.rate = (voice === "taiwan_female" ? 1.0 : 1.08) * speechRate;
       utterance.pitch = 1;
+      activeSystemUtterance = utterance;
       utterance.onstart = () => onActualStart(durationEstimate);
       utterance.onend = onEnd;
       utterance.onerror = (event) => {
@@ -929,24 +1077,30 @@
     };
 
     const prepareNeuralVoice = async () => {
+      const speechRequestedAt = performance.now();
+      if (timing) timing.audio_mode = "neural";
       const response = await fetch("/api/agent/speech", {
         method: "POST",
         credentials: "same-origin",
         cache: "no-store",
         signal: controller.signal,
         headers: { "Content-Type": "application/json", "X-Client-Id": getClientId() },
-        body: JSON.stringify({ text: cleanText, voice }),
+        body: JSON.stringify({ text: cleanText, voice, language, ...(taskId ? { task_id: taskId } : {}) }),
       });
       if (!response.ok) {
         const payload = await response.json().catch(() => ({}));
         throw new Error(payload.error || `语音生成失败：${response.status}`);
       }
       const blob = await response.blob();
+      const audioReceivedAt = performance.now();
+      if (timing) timing.audio_download_ms = audioReceivedAt - speechRequestedAt;
       if (!isCurrent()) return;
       if (!blob.size) throw new Error("语音服务返回了空音频。 ");
       activeAudioUrl = URL.createObjectURL(blob);
       const audio = new Audio(activeAudioUrl);
       activeAudio = audio;
+      audio.playbackRate = speechRate;
+      audio.preservesPitch = true;
       audio.preload = "auto";
       await new Promise((resolve, reject) => {
         const timeout = window.setTimeout(() => reject(new Error("音频加载超时。")), 5000);
@@ -961,8 +1115,91 @@
         if (audio.readyState >= 1) settle(resolve);
       });
       if (!isCurrent()) return;
-      audio.onplaying = () => onActualStart(audio.duration);
-      audio.onended = onEnd;
+      if (timing) timing.audio_metadata_ms = performance.now() - audioReceivedAt;
+      // Send the real media clock, including buffering/pauses. One request and
+      // one latest snapshot prevent a slow backend from building a stale queue.
+      // System speech has no media clock and keeps the approximate path above.
+      let clockTimer = null;
+      let clockRequest = null;
+      let clockPending = null;
+      let clockInFlight = null;
+      let clockSequence = 0;
+      let clockStopped = false;
+      const stopClock = () => {
+        clockStopped = true;
+        window.clearInterval(clockTimer);
+        clockTimer = null;
+        clockPending = null;
+        clockRequest?.abort();
+      };
+      playbackClockCleanup = stopClock;
+      const reportClock = (state) => {
+        if (!onPlaybackProgress || !playbackStarted || !isCurrent() || clockStopped ||
+            !Number.isFinite(audio.duration) || audio.duration <= 0 || audio.duration > 120) {
+          return Promise.resolve();
+        }
+        clockPending = {
+          position_s: Math.max(0, Math.min(audio.duration, audio.currentTime)),
+          duration_s: audio.duration,
+          playback_rate: audio.playbackRate,
+          state,
+          sequence: ++clockSequence,
+        };
+        if (!clockInFlight) {
+          clockInFlight = (async () => {
+            // Never report a clock before the deferred motion has started.
+            await startPromise;
+            while (clockPending && isCurrent() && !clockStopped) {
+              const progress = clockPending;
+              clockPending = null;
+              const request = new AbortController();
+              clockRequest = request;
+              const abort = () => request.abort();
+              controller.signal.addEventListener("abort", abort, { once: true });
+              const timeout = window.setTimeout(abort, 1500);
+              try {
+                const result = await onPlaybackProgress(progress, request.signal);
+                if (result?.accepted === false) stopClock();
+              } finally {
+                window.clearTimeout(timeout);
+                controller.signal.removeEventListener("abort", abort);
+                if (clockRequest === request) clockRequest = null;
+              }
+            }
+          })().catch((error) => {
+            // Clock loss uses the engine's bounded timing fallback. It must not
+            // replay audio or launch the same robot plan again.
+            if (isCurrent() && !clockStopped) {
+              console.warn("Agent playback clock unavailable; using estimated timing", error.message);
+            }
+            stopClock();
+          }).finally(() => { clockInFlight = null; });
+        }
+        return clockInFlight;
+      };
+      audio.onplaying = () => {
+        onActualStart(audio.duration / audio.playbackRate, audio.duration);
+        void reportClock("playing");
+      };
+      reportActiveAudioClock = () => void reportClock(audio.paused || audio.readyState < 3 ? "paused" : "playing");
+      audio.onpause = () => { if (!audio.ended) void reportClock("paused"); };
+      audio.onwaiting = () => { void reportClock("paused"); };
+      audio.onstalled = () => {
+        void reportClock(audio.paused || audio.readyState < 3 ? "paused" : "playing");
+      };
+      audio.onended = () => {
+        window.clearInterval(clockTimer);
+        clockTimer = null;
+        // Flush the final sample before finish() aborts the speech controller.
+        void reportClock("ended").then(onEnd);
+      };
+      if (onPlaybackProgress) {
+        clockTimer = window.setInterval(() => {
+          if (!audio.ended) {
+            void reportClock(audio.paused || audio.readyState < 3 ? "paused" : "playing");
+          }
+        }, 250);
+      }
       audio.onerror = () => finish(new Error("语音播放中断，本次交互已停止。"));
       const play = async () => {
         if (!isCurrent()) return;
@@ -1008,7 +1245,8 @@
     elements.previewVoiceButton.disabled = true;
     setSettingsMessage("正在准备试听，只播放声音，不执行动作…");
     try {
-      await speakReply(`你好呀，我是${elements.agentNameInput.value.trim() || agentName}，很高兴见到你。`);
+      const name = elements.agentNameInput.value.trim() || agentName;
+      await speakReply(speechLanguage === "en" ? `Hi, I'm ${name}. Nice to meet you!` : `你好呀，我是${name}，很高兴见到你。`);
       setSettingsMessage("试听结束，可以选择喜欢的音色后保存设置。", "success");
     } catch (error) {
       setSettingsMessage(error.message, "error");
@@ -1018,32 +1256,84 @@
     }
   }
 
+  function looksLikeAssistantEcho(text) {
+    if (isLocalStopCommand(text)) return false;
+    if (!assistantAudioPlaying && performance.now() - assistantSpeechEndedAt > 1000) return false;
+    const compact = (value) => String(value || "").toLowerCase().replace(/[\s\p{P}\p{S}]/gu, "");
+    const heard = compact(text);
+    const spoken = compact(assistantSpokenText);
+    if (!heard || !spoken) return false;
+    if (heard === spoken || (heard.length >= 3 && spoken.includes(heard)) ||
+        (assistantAudioPlaying && heard.length >= 2 && spoken.startsWith(heard))) return true;
+    if (heard.length < 5) return false;
+    const pairs = (value) => new Set(Array.from({ length: value.length - 1 }, (_, index) => value.slice(index, index + 2)));
+    const heardPairs = pairs(heard);
+    const spokenPairs = pairs(spoken);
+    const shared = [...heardPairs].filter((pair) => spokenPairs.has(pair)).length;
+    return shared / heardPairs.size >= 0.8;
+  }
+
+  function beginVoiceInterruption() {
+    if (voicePreempted || !(agentBusy || speaking || readyTaskId || remoteMotion?.active)) return;
+    const generation = invalidateInteraction();
+    voicePreempted = true;
+    setAgentState("listening", "听到你插话了，正在保持机械臂当前位置…");
+    voicePreemptPromise = api("/api/agent/interrupt", {
+      method: "POST", body: JSON.stringify({ client_sequence: generation }),
+    }).catch((error) => {
+      if (generation === interactionGeneration) {
+        localAgentError = friendlyAgentError(error.message);
+        elements.voiceStateText.textContent = localAgentError;
+      }
+    });
+  }
+
   function createRecognition() {
     if (!SpeechRecognition) return null;
     const instance = new SpeechRecognition();
-    instance.lang = "zh-CN";
+    instance.lang = speechLocale(speechLanguage);
     instance.continuous = true;
     instance.interimResults = true;
     instance.maxAlternatives = 1;
+    let speechEndedAt = null;
+    instance.onspeechstart = () => { speechEndedAt = null; };
+    instance.onspeechend = () => { speechEndedAt = performance.now(); };
 
     instance.onstart = () => {
       recognitionRunning = true;
       if (voiceEnabled && !speaking && !agentBusy && !renderMotionStatus()) setAgentState("listening");
     };
     instance.onresult = (event) => {
-      let interimText = "";
+      const interimParts = [];
       const finalParts = [];
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
         const transcript = event.results[index][0]?.transcript || "";
         if (event.results[index].isFinal) finalParts.push(transcript);
-        else interimText += transcript;
+        else interimParts.push(transcript);
       }
-      if (interimText) elements.rawTranscript.textContent = interimText;
-      const finalText = finalParts.join("").trim();
+      const separator = instance.lang === "en-US" ? " " : "";
+      const interimText = interimParts.join(separator).trim();
+      if (interimText.trim().length >= 2 && !looksLikeAssistantEcho(interimText)) {
+        elements.rawTranscript.textContent = interimText;
+        // Recognition interim text only requests a hold; it never starts an
+        // unfinished/possibly negated motion. Wait for final text to plan.
+        if (voiceInterimTimer === null) {
+          voiceInterimTimer = window.setTimeout(() => {
+            voiceInterimTimer = null;
+            beginVoiceInterruption();
+          }, 120);
+        }
+      }
+      const finalText = finalParts.join(separator).trim();
       if (finalText) {
+        window.clearTimeout(voiceInterimTimer);
+        voiceInterimTimer = null;
+        const recognitionMs = speechEndedAt === null ? null : performance.now() - speechEndedAt;
+        speechEndedAt = null;
+        if (!voicePreempted && looksLikeAssistantEcho(finalText)) return;
         elements.rawTranscript.textContent = finalText;
         setAgentState("transcribing");
-        void sendMessage(finalText, "voice");
+        void sendMessage(finalText, "voice", recognitionMs);
       }
     };
     instance.onerror = (event) => {
@@ -1058,16 +1348,15 @@
     };
     instance.onend = () => {
       recognitionRunning = false;
+      window.clearTimeout(voiceInterimTimer);
+      voiceInterimTimer = null;
       scheduleRecognitionRestart();
     };
     return instance;
   }
 
   function startRecognition() {
-    // Keep the microphone session alive while the cloud request is pending.  The
-    // message gate ignores ordinary extra utterances, but STOP words must remain
-    // available until the operator explicitly turns voice mode off.
-    if (!voiceEnabled || speaking || recognitionRunning || !recognition) return;
+    if (!voiceEnabled || recognitionRunning || !recognition) return;
     window.clearTimeout(restartTimer);
     try {
       recognition.start();
@@ -1080,6 +1369,8 @@
 
   function pauseRecognition() {
     window.clearTimeout(restartTimer);
+    window.clearTimeout(voiceInterimTimer);
+    voiceInterimTimer = null;
     if (!recognition || !recognitionRunning) return;
     try {
       recognition.abort();
@@ -1090,7 +1381,7 @@
 
   function scheduleRecognitionRestart() {
     window.clearTimeout(restartTimer);
-    if (!voiceEnabled || speaking) return;
+    if (!voiceEnabled) return;
     restartTimer = window.setTimeout(startRecognition, 280);
   }
 
@@ -1118,7 +1409,7 @@
     const small = elements.voiceToggleButton.querySelector("small");
     if (voiceEnabled) {
       strong.textContent = "停止语音 Agent";
-      small.textContent = "当前会话持续监听中";
+      small.textContent = "持续监听并支持插话，使用耳机会更稳定";
     } else {
       strong.textContent = "开始语音 Agent";
       small.textContent = "开启后持续监听，直到手动关闭";
@@ -1129,11 +1420,6 @@
   function toggleVoice() {
     if (!SpeechRecognition) {
       setAgentState("error", "当前浏览器不支持持续语音识别，请使用支持 SpeechRecognition 的浏览器。 ");
-      return;
-    }
-    if (!settingsConfigured) {
-      openSettings();
-      setAgentState("error", "请先配置云端模型。 ");
       return;
     }
     voiceEnabled = !voiceEnabled;
@@ -1229,11 +1515,18 @@
     });
     elements.voiceToggleButton.addEventListener("click", toggleVoice);
     elements.cancelAgentButton.addEventListener("click", () => void cancelInteraction());
-    elements.voiceSelect.addEventListener("change", () => {
-      localStorage.setItem(VOICE_KEY, elements.voiceSelect.value);
-      stopSpeech();
-    });
-    byId("stopButton")?.addEventListener("click", invalidateInteraction);
+    elements.speechLanguageSelect?.addEventListener("change", () => setSpeechLanguage(elements.speechLanguageSelect.value));
+    for (const control of [elements.voiceSelect, elements.chatVoiceSelect]) {
+      control?.addEventListener("change", () => {
+        voicePreference = control.value;
+        storePreference(VOICE_KEY, voicePreference);
+        if (elements.chatVoiceSelect) elements.chatVoiceSelect.value = voicePreference;
+        elements.voiceSelect.value = voicePreference;
+      });
+    }
+    for (const control of [elements.speechRateSelect, elements.settingsSpeechRateSelect]) {
+      control?.addEventListener("change", () => setSpeechRate(control.value));
+    }
     window.addEventListener("pagehide", () => {
       voiceEnabled = false;
       pauseRecognition();
@@ -1268,10 +1561,12 @@
   }
 
   function init() {
+    setSpeechRate(storedPreference(SPEECH_RATE_KEY) || 1.5, false);
     setTheme(localStorage.getItem(THEME_KEY) || "pink");
     mountModeControls();
     bindEvents();
-    populateVoices();
+    voicePreference = storedPreference(VOICE_KEY) || DEFAULT_VOICE;
+    setSpeechLanguage(storedPreference(LANGUAGE_KEY), false);
     if (window.speechSynthesis) {
       speechSynthesis.addEventListener("voiceschanged", populateVoices);
     }

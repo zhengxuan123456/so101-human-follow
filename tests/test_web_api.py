@@ -5,6 +5,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from so101_human_follow.agent_actions import VisualProximity
 from so101_human_follow.agent_schema import AgentAction, InteractionPlan
 from so101_human_follow.agent_service import AgentService
 from so101_human_follow.config import load_config
@@ -186,7 +187,7 @@ class WebApiTest(unittest.TestCase):
 
 class WebEngineSnapshotTest(unittest.TestCase):
     def _arm_ready_engine(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_arm_ready_123456"
         engine.heartbeat(client_id)
@@ -210,7 +211,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         return engine, client_id, robot
 
     def test_snapshot_marks_lower_two_fixed_and_upper_four_moving(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_snapshot_123456"
         engine.heartbeat(client_id)
@@ -229,7 +230,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         )
 
     def test_neutral_channels_can_be_collected_on_separate_frames(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         config = replace(config, pose=replace(config.pose, neutral_sample_count=1))
         engine = ControlEngine(config, robot_allowed=False)
         engine._collecting_neutral = True
@@ -272,7 +273,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertAlmostEqual(engine._neutral.hand_open, features.hand_open)
 
     def test_one_valid_channel_keeps_tracking_alive_until_all_are_lost(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         engine._armed = True
         engine._motion_stop.clear()
@@ -300,7 +301,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertFalse(engine._armed)
 
     def test_old_arm_command_is_invalidated_by_disarm(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_epoch_123456789"
         engine.heartbeat(client_id)
@@ -315,7 +316,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
             engine._authorize_command(command)
 
     def test_old_safe_range_start_is_invalidated_by_disarm(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_range_epoch_12345"
         engine.heartbeat(client_id)
@@ -330,7 +331,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
             engine._authorize_command(command)
 
     def test_disarm_requests_active_safe_range_cancellation(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         engine._range_state = "RECORDING"
         engine.disarm("page closed")
@@ -340,7 +341,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         class ConnectedRobot:
             connected = True
 
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_atomic_arm_12345"
         engine.heartbeat(client_id)
@@ -386,38 +387,53 @@ class WebEngineSnapshotTest(unittest.TestCase):
 
         self.assertFalse(engine._armed)
 
-    def test_agent_motion_fails_closed_when_visual_proximity_is_unusable(self):
-        cases = (
-            ("UNKNOWN", time.monotonic(), "visual proximity UNKNOWN"),
-            ("TOO_CLOSE", time.monotonic(), "visual proximity TOO_CLOSE"),
-            (
-                "SAFE",
-                time.monotonic() - load_config("config.json").safety.tracking_timeout_s - 1.0,
-                "visual proximity is stale",
-            ),
-        )
-        for state, observed_at, expected_error in cases:
-            with self.subTest(state=state, observed_at=observed_at):
+    def test_agent_motion_can_run_without_usable_visual_proximity(self):
+        for state in ("UNKNOWN", "TOO_CLOSE", "SAFE"):
+            with self.subTest(state=state):
                 engine, client_id, robot = self._arm_ready_engine()
-                robot.send = lambda action: self.fail("Agent must not send without fresh proximity")
-                engine._agent_plan = SimpleNamespace(name="test Agent motion")
-                engine._agent_plan_client = client_id
-                engine._agent_plan_epoch = engine._epoch
-                engine._agent_motion_state = "RUNNING"
-                engine._visual_proximity = SimpleNamespace(
-                    state=state,
-                    reason="no reliable visual scale",
+                positions = dict(engine._initial)
+                goals = []
+
+                def send_targets(action, active_joints, fixed):
+                    goals.append(dict(action))
+                    return dict(action), dict(positions)
+
+                robot.read_positions = lambda: dict(positions)
+                robot.send_agent_targets = send_targets
+                now = time.monotonic()
+                engine._visual_proximity = VisualProximity(state, "test camera state")
+                engine._visual_proximity_time = (
+                    now - engine.config.safety.tracking_timeout_s - 1.0 if state == "SAFE" else now
                 )
-                engine._visual_proximity_time = observed_at
+                engine._start_agent_plan(
+                    [{"name": "open_gripper", "arguments": {}}],
+                    client_id=client_id,
+                    submitted_epoch=engine._epoch,
+                )
+                last_tick = engine._send_agent_if_due(now, 0.0)
+                engine._send_agent_if_due(now + 0.2, last_tick)
 
-                engine._send_agent_if_due(time.monotonic(), 0.0)
+                self.assertTrue(goals)
+                self.assertNotEqual(goals[-1]["gripper.pos"], positions["gripper.pos"])
+                self.assertIsNotNone(engine._agent_plan)
+                self.assertFalse(engine._motion_stop.is_set())
 
-                self.assertIsNone(engine._agent_plan)
-                self.assertTrue(engine._motion_stop.is_set())
-                self.assertIn(expected_error, engine._agent_motion_error)
+    def test_visual_following_disarms_when_operator_is_too_close(self):
+        engine, _, _ = self._arm_ready_engine()
+        engine._armed = True
+        engine._motion_stop.clear()
+        detection = PoseDetection(engine._latest_features, (), 1, "tracking")
+        with patch(
+            "so101_human_follow.web_engine.estimate_visual_proximity",
+            return_value=VisualProximity("TOO_CLOSE", "test camera state"),
+        ):
+            engine._update_tracking(detection, time.monotonic())
+
+        self.assertFalse(engine._armed)
+        self.assertTrue(engine._motion_stop.is_set())
 
     def test_connect_is_rejected_while_base_calibration_is_active(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_calibration_123456"
         engine.heartbeat(client_id)
@@ -432,7 +448,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertEqual(engine._base_calibration_state, "WAITING_MIDDLE")
 
     def test_neutral_request_is_rejected_without_cancelling_agent_motion(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         plan = SimpleNamespace(name="test Agent motion")
         engine._agent_plan = plan
@@ -447,7 +463,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertEqual(engine._epoch, epoch)
 
     def test_stop_refuses_to_promise_hold_when_release_is_pending(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         engine._armed = True
         engine._motion_stop.clear()
@@ -458,7 +474,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         self.assertTrue(engine._motion_stop.is_set())
 
     def test_hardware_commands_require_exact_confirmation_code(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         with self.assertRaisesRegex(ControlError, "123"):
             engine._connect_robot("connect COM4")
@@ -468,7 +484,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
             engine._disconnect_robot("DISCONNECT COM4")
 
     def test_worker_rechecks_lease_before_command_execution(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_lease_12345678"
         engine.heartbeat(client_id)
@@ -483,7 +499,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
             engine._authorize_command(command)
 
     def test_expired_lease_sets_motion_stop_before_full_disarm(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         engine._operator_client = "old_client_12345678"
         engine._operator_heartbeat = time.monotonic() - engine.lease_timeout_s - 1.0
@@ -510,7 +526,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
         class ConnectedRobot:
             connected = True
 
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         client_id = "client_release_123456"
         engine.heartbeat(client_id)
@@ -545,7 +561,7 @@ class WebEngineSnapshotTest(unittest.TestCase):
                     raise RuntimeError("test timed out waiting to release send")
                 return dict(action)
 
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         engine = ControlEngine(config, robot_allowed=True)
         robot = BlockingRobot()
         neutral = PoseFeatures(0.0, 0.0, 0.5, 0.5)
@@ -626,7 +642,7 @@ class AgentStopRaceTest(unittest.TestCase):
                 "so101_human_follow.agent_service.OpenAICompatibleClient",
                 SlowClient,
             ):
-                queued = service.submit_text("张开夹爪", context={"client_id": "test"})
+                queued = service.submit_text("夹爪稍微打开一点", context={"client_id": "test"})
                 self.assertTrue(model_started.wait(1.0))
                 cancelled = service.cancel_all("operator pressed stop-following")
                 self.assertEqual(cancelled, [queued["task_id"]])

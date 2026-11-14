@@ -6,7 +6,7 @@ import logging
 import math
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from .config import ALL_JOINTS, RobotSettings
 
@@ -134,6 +134,14 @@ class SO101RobotAdapter:
         if not all(math.isfinite(value) for value in positions.values()):
             raise RuntimeError("Robot returned a non-finite joint position.")
         return positions
+
+    def calibration_ranges(self) -> dict[str, tuple[int, int]]:
+        if self.robot is None:
+            return {}
+        return {
+            f"{name}.pos": (int(calibration.range_min), int(calibration.range_max))
+            for name, calibration in self.robot.calibration.items()
+        }
 
     def calibration_fingerprint(self) -> str:
         if self.robot is None or not self.robot.calibration:
@@ -330,17 +338,21 @@ class SO101RobotAdapter:
         self, action: dict[str, float], active_joints: tuple[str, ...],
         fixed_positions: dict[str, float],
     ) -> tuple[dict[str, float], dict[str, float]]:
-        """Write only this step's moving axes and the two fixed-base holds."""
+        """Write selected Agent axes plus encoder-seeded holds for inactive axes."""
         if not self.connected or self.robot is None:
             raise RuntimeError("Robot is not connected.")
         if self.manual_range_active or self.fixed_positioning_active:
             raise RuntimeError("Motion commands are disabled during manual joint positioning.")
         selected = set(active_joints) | set(fixed_positions)
+        if len(set(active_joints)) != len(active_joints):
+            raise ValueError("Agent listed one active joint more than once.")
+        if set(active_joints) & set(fixed_positions):
+            raise ValueError("An active Agent joint cannot also be held fixed.")
         if not selected <= set(ALL_JOINTS):
             raise ValueError("Agent requested an unknown joint.")
         observed = self.read_positions()
         goals = {
-            joint.removesuffix(".pos"): float(fixed_positions.get(joint, action[joint]))
+            joint.removesuffix(".pos"): float(fixed_positions[joint] if joint in fixed_positions else action[joint])
             for joint in selected
         }
         if not all(math.isfinite(value) for value in goals.values()):
@@ -352,7 +364,8 @@ class SO101RobotAdapter:
         goals = ensure_safe_goal_position(
             {motor: (goal, observed[f"{motor}.pos"]) for motor, goal in goals.items()}, caps,
         )
-        self.robot.bus.sync_write("Goal_Position", goals)
+        if goals:
+            self.robot.bus.sync_write("Goal_Position", goals)
         sent = dict(observed)
         sent.update({f"{motor}.pos": goal for motor, goal in goals.items()})
         return sent, observed
@@ -373,17 +386,22 @@ class SO101RobotAdapter:
 class SO101CalibrationSession:
     """Manual six-axis LeRobot calibration without ever enabling motor torque."""
 
-    def __init__(self, settings: RobotSettings):
+    def __init__(
+        self,
+        settings: RobotSettings,
+        *,
+        device_factory: Callable[[], Any] | None = None,
+        single_turn_wrist: bool = True,
+    ):
         self.settings = settings
+        self._device_factory = device_factory or self._make_follower
+        self._single_turn_wrist = single_turn_wrist
         self.robot: Any | None = None
         self.active = False
         self.homing_offsets: dict[str, int] | None = None
 
-    def start(self) -> dict[str, int]:
-        if self.active or self.robot is not None:
-            raise RuntimeError("Base calibration is already active.")
+    def _make_follower(self) -> Any:
         _make_lerobot_importable()
-        from lerobot.motors.feetech import OperatingMode
         from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 
         config = SO101FollowerConfig(
@@ -397,10 +415,16 @@ class SO101CalibrationSession:
             ),
             disable_torque_on_disconnect=True,
         )
-        self.robot = SO101Follower(config)
+        return SO101Follower(config)
+
+    def start(self) -> dict[str, int]:
+        if self.active or self.robot is not None:
+            raise RuntimeError("Base calibration is already active.")
+        self.robot = self._device_factory()
         try:
-            # Deliberately bypass SO101Follower.connect(): it calls configure(), whose
-            # context manager re-enables torque. Calibration must remain hand-movable.
+            from lerobot.motors.feetech import OperatingMode
+
+            # Open the bus directly so device configuration cannot enable torque.
             self.robot.bus.connect()
             self.robot.bus.disable_torque()
             for motor in self.robot.bus.motors:
@@ -462,7 +486,7 @@ class SO101CalibrationSession:
                 )
             if low >= high:
                 raise ValueError(f"Motor '{motor}' did not move through a valid range.")
-            if motor == "wrist_roll" and high > 4095:
+            if self._single_turn_wrist and motor == "wrist_roll" and high > 4095:
                 raise ValueError(
                     f"ID5 wrist_roll 最大值超过4095（当前为 {high}），"
                     "请重新采集且不要跨圈，并注意摄像头线缆。"

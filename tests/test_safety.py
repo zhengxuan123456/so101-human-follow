@@ -9,7 +9,7 @@ from so101_human_follow.safety import MotionController, signed_deadband
 class SafetyTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.config = load_config("config.json")
+        cls.config = load_config("config.example.json")
 
     def setUp(self):
         self.initial = preview_initial_positions()

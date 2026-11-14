@@ -9,6 +9,11 @@ _STOP_PATTERNS = (
     re.compile(r"(?:请|麻烦你)?(?:马上|立即|赶快|快点)?(?:停止|停下(?:来)?|别动|不要动|急停)"),
     re.compile(r"^(?:小\S{0,8}[，,]?\s*)?(?:停|停住|别动)[！!。.]?$"),
 )
+_ENGLISH_STOP = re.compile(
+    r"(?:please\s+)?(?:emergency\s+stop|stop(?:\s+moving)?|halt|freeze|"
+    r"(?:do\s+not|don['’]t)\s+move)(?:\s+now)?(?:[,\s]+please)?[.!?]*",
+    re.IGNORECASE,
+)
 
 _PHRASE_REPLACEMENTS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"(?:机械)?(?:夹抓|甲爪|手爪|爪子)"), "夹爪"),
@@ -53,7 +58,10 @@ def _remove_agent_name(text: str, agent_name: str) -> tuple[str, bool]:
     name = _compact_text(agent_name)
     if not name:
         return text, False
-    pattern = re.compile(rf"^(?:你好[，,]?\s*)?{re.escape(name)}(?:[，,、:：]\s*|\s+)")
+    pattern = re.compile(
+        rf"^(?:你好[，,]?\s*|(?:hi|hey|hello)[\s,]+)?{re.escape(name)}(?:[，,、:：]\s*|\s+)",
+        re.IGNORECASE,
+    )
     updated = pattern.sub("", text, count=1).strip()
     return updated, updated != text
 
@@ -71,7 +79,7 @@ def _normalize_counts(text: str) -> tuple[str, bool]:
 
 
 def normalize_speech(text: str, *, agent_name: str = "") -> SpeechNormalization:
-    """Normalize a short Chinese utterance without inventing robot intent.
+    """Normalize a short utterance without inventing robot intent.
 
     The function deliberately performs only deterministic vocabulary cleanup.  It
     never turns uncertain prose into joint positions or motion parameters.  Both
@@ -86,8 +94,10 @@ def normalize_speech(text: str, *, agent_name: str = "") -> SpeechNormalization:
     if len(original) > 500:
         raise ValueError("Speech text is too long.")
 
-    emergency_stop = any(pattern.search(original) for pattern in _STOP_PATTERNS)
     normalized, removed_name = _remove_agent_name(original, agent_name)
+    emergency_stop = bool(_ENGLISH_STOP.fullmatch(normalized)) or any(
+        pattern.search(original) for pattern in _STOP_PATTERNS
+    )
     corrections: list[str] = []
     if removed_name:
         corrections.append("removed_agent_name")
@@ -116,3 +126,9 @@ def normalize_speech(text: str, *, agent_name: str = "") -> SpeechNormalization:
         corrections=tuple(dict.fromkeys(corrections)),
         emergency_stop=emergency_stop,
     )
+
+
+def normalize_language(value: str) -> str:
+    if isinstance(value, str) and (language := value.strip().casefold()) in {"zh", "en"}:
+        return language
+    raise ValueError("语言必须为 zh（中文）或 en（英文）。")

@@ -377,6 +377,48 @@ summary:focus-visible {
   min-width: 0;
 }
 
+.camera-connection {
+  display: flex;
+  align-items: end;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 14px 20px;
+  border-bottom: 1px solid var(--line);
+  background: var(--agent-softer);
+}
+
+.camera-name-field {
+  display: grid;
+  flex: 1 1 13rem;
+  gap: 5px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 0.8rem;
+}
+
+.camera-name-field input {
+  width: 100%;
+  min-width: 0;
+  min-height: 40px;
+  padding: 8px 10px;
+  border: 1px solid var(--line-bright);
+  border-radius: 10px;
+  color: var(--text);
+  background: var(--input-bg);
+}
+
+.camera-status {
+  flex: 0 0 100%;
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.76rem;
+  overflow-wrap: anywhere;
+}
+
+.camera-status.is-error {
+  color: var(--red-deep);
+}
+
 .video-follow-hint {
   margin: 12px 16px 0;
   color: var(--muted);
@@ -478,6 +520,10 @@ summary:focus-visible {
 
 .video-stage {
   background: #111820;
+}
+
+.video-fallback {
+  color: #d6e6eb;
 }
 
 .video-overlay {
@@ -720,6 +766,17 @@ summary:focus-visible {
 
 .agent-message-form input {
   flex: 1;
+  min-width: 0;
+}
+
+.agent-speech-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(145px, 1fr));
+  gap: 8px;
+  margin: 0 18px 12px;
+}
+
+.agent-speech-options .form-field {
   min-width: 0;
 }
 

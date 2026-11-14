@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import ipaddress
 import logging
 import math
 import re
 import secrets
 import sys
+import threading
 import time
 import webbrowser
 from dataclasses import replace
@@ -18,10 +20,13 @@ from flask import Flask, Response, abort, jsonify, make_response, render_templat
 from werkzeug.exceptions import HTTPException
 from werkzeug.serving import make_server
 
+from .agent_actions import MAX_LOCAL_AGENT_ACTIONS
 from .agent_schema import InteractionPlan
 from .agent_service import AgentService
+from .camera_device import list_camera_names
 from .config import load_config
 from .speech_normalizer import normalize_speech
+from .simulation import ActionLibrary, DeletedActionError, create_simulation_blueprint
 from .speech_synthesis import (
     SpeechBusyError,
     SpeechSynthesisError,
@@ -91,7 +96,7 @@ def create_app(
     app.extensions["so101_speech_synthesizer"] = speech_synthesizer
     token = control_token or secrets.token_urlsafe(32)
     app.config.update(
-        MAX_CONTENT_LENGTH=4096,
+        MAX_CONTENT_LENGTH=65536,
         SO101_CONTROL_TOKEN=token,
         JSON_SORT_KEYS=False,
     )
@@ -129,8 +134,37 @@ def create_app(
             )
 
         motion_actions: list[dict[str, object]] = []
-        for action in plan.actions:
+        source_indices: list[int] = []
+        resume = context.get("resume_motion") or {}
+        resume_used = False
+        def signature(value):
+            return {"name": value.get("name"), "arguments": {key: item for key, item in value.get("arguments", {}).items() if key != "speed"}}
+        for semantic_index, action in enumerate(plan.actions):
             arguments = dict(action.arguments)
+            before = len(motion_actions)
+            if (action.name != "return_to_neutral" and not resume_used and resume
+                    and signature({"name": action.name, "arguments": arguments}) == signature(resume.get("action", {}))):
+                for frame in resume.get("frames", []):
+                    if frame["targets"]:
+                        args = {"targets": frame["targets"], "hold_s": frame["hold_s"], "return_to_start": False}
+                        if frame.get("duration_s") is not None:
+                            args["duration_s"] = frame["duration_s"]
+                        if frame.get("joint_timing") is not None:
+                            args["joint_timing"] = frame["joint_timing"]
+                        motion_actions.append({"name": "move_joints", "arguments": args, "_completed_cycles": frame.get("completed_cycles", 0)})
+                    else:
+                        motion_actions.append({"name": "wait", "arguments": {"seconds": frame["hold_s"]}})
+                source_indices.extend([semantic_index] * (len(motion_actions) - before))
+                resume_used = True
+                continue
+            if action.name == "perform_custom_action":
+                blocks = action_library.execution_blocks(str(arguments["action_id"]))
+                for block in blocks:
+                    if block["name"] == "return_to_plan_start":
+                        block = {**block, "arguments": {"start_action_index": before}}
+                    motion_actions.append(block)
+                source_indices.extend([semantic_index] * (len(motion_actions) - before))
+                continue
             if action.name in {
                 "perform_greeting",
                 "open_gripper",
@@ -143,6 +177,7 @@ def create_app(
                 "wait",
             }:
                 motion_actions.append({"name": action.name, "arguments": arguments})
+                source_indices.append(semantic_index)
                 continue
             if action.name == "perform_gesture":
                 gesture = str(arguments.get("gesture", ""))
@@ -170,6 +205,7 @@ def create_app(
                             "arguments": {"count": count, "amplitude": amplitude},
                         }
                     )
+                source_indices.extend([semantic_index] * (len(motion_actions) - before))
                 continue
             if action.name == "perform_dance":
                 duration = float(arguments.get("duration_seconds", 5.0))
@@ -186,10 +222,11 @@ def create_app(
                         },
                     ]
                 )
+                source_indices.extend([semantic_index] * (len(motion_actions) - before))
                 continue
             raise ControlError(f"Unsupported local Agent action: {action.name}")
 
-        if len(motion_actions) > 12:
+        if len(motion_actions) > MAX_LOCAL_AGENT_ACTIONS:
             raise ControlError("The Agent motion plan is too long; please split the request.")
         if not motion_actions:
             return {"ok": True, "message": "Reply only; no robot action requested."}
@@ -202,6 +239,10 @@ def create_app(
             {
                 "actions": motion_actions,
                 "speech_duration_s": context.get("speech_duration_s"),
+                "media_duration_s": context.get("media_duration_s"),
+                "playback_rate": context.get("playback_rate", 1.0),
+                "semantic_actions": [{"name": action.name, "arguments": dict(action.arguments)} for action in plan.actions],
+                "source_indices": source_indices,
             },
             client_id=operator,
         )
@@ -216,6 +257,7 @@ def create_app(
         # stop interrupts anything already queued/running; cancel_all then waits
         # out (or invalidates) the dispatch boundary; the final stop covers the
         # narrow case where a dispatch crossed the boundary after the first one.
+        speech_synthesizer.cancel_current()
         result = engine_stop(reason)
         try:
             agent_service.cancel_all(reason)
@@ -242,6 +284,59 @@ def create_app(
         if not engine.heartbeat(value):
             abort(409, "Another browser tab currently owns the control lease.")
         return value
+
+    def joint_limits():
+        if hasattr(engine, "agent_joint_limits"):
+            return {"limits": engine.agent_joint_limits(), "calibration_fingerprint": engine._calibration_fingerprint or ""}
+        return {"limits": {joint: ((0.0, 100.0) if joint == "gripper.pos" else (-70.0, 70.0)) for joint in (
+            "shoulder_pan.pos", "shoulder_lift.pos", "elbow_flex.pos", "wrist_flex.pos", "wrist_roll.pos", "gripper.pos")}}
+
+    action_directory = (preferences_path.parent if preferences_path is not None else Path(__file__).resolve().parents[2]) / "action_library"
+    action_library = ActionLibrary(action_directory, joint_limits)
+    simulation_blueprint, simulation_service = create_simulation_blueprint(
+        require_operator=require_operator, limits_provider=joint_limits, library=action_library,
+    )
+    app.register_blueprint(simulation_blueprint)
+    app.extensions["so101_simulation"] = simulation_service
+    app.extensions["so101_action_library"] = action_library
+    agent_request_gate = threading.RLock()
+    client_sequences: dict[str, int] = {}
+    reserved_sequences: dict[str, int] = {}
+    interruptions: dict[str, dict] = {}
+
+    def accept_sequence(operator: str, payload: dict, *, reserve=False, stop=False):
+        if not isinstance(payload, dict):
+            abort(400, "请求必须是JSON对象。")
+        sequence = payload.get("client_sequence")
+        if sequence is None:
+            return
+        if isinstance(sequence, bool) or not isinstance(sequence, int) or not 0 < sequence < 2**31:
+            abort(400, "client_sequence不正确。")
+        latest = client_sequences.get(operator, -1)
+        reserved = reserved_sequences.get(operator)
+        if not stop and (sequence < latest or (sequence == latest and (reserve or reserved != sequence))):
+            abort(409, "这条消息已被更新的指令替代。")
+        client_sequences[operator] = max(latest, sequence)
+        if reserve:
+            reserved_sequences[operator] = sequence
+        else:
+            reserved_sequences.pop(operator, None)
+        if len(client_sequences) > 128:
+            oldest = next(iter(client_sequences))
+            client_sequences.pop(oldest, None)
+            reserved_sequences.pop(oldest, None)
+            interruptions.pop(oldest, None)
+
+    def preempt_interaction(operator: str) -> dict:
+        snapshot = engine.interruption_snapshot() if hasattr(engine, "interruption_snapshot") else {}
+        resume = snapshot.pop("_resume", None)
+        if resume is None:
+            resume = agent_service.interruption_resume(operator)
+        context = agent_service.interruption_context(operator, execution_snapshot=snapshot)
+        agent_stop("new utterance interrupted the previous interaction")
+        if snapshot.get("state") in {"RUNNING", "RETURNING", "PAUSED"}:
+            engine.submit("agent_interrupt_hold", client_id=operator, timeout_s=3.0)
+        return {"context": context, "resume": resume, "created_at": time.monotonic()}
 
     @app.before_request
     def enforce_local_session() -> None:
@@ -274,7 +369,7 @@ def create_app(
             "camera=(), microphone=(self), geolocation=(), usb=(), serial=()"
         )
         response.headers["Content-Security-Policy"] = (
-            "default-src 'self'; img-src 'self' data:; script-src 'self'; "
+            "default-src 'self'; img-src 'self' data: blob:; script-src 'self'; "
             "style-src 'self'; connect-src 'self'; media-src 'self' blob:; object-src 'none'; "
             "frame-ancestors 'none'; base-uri 'none'; form-action 'none'"
         )
@@ -326,14 +421,7 @@ def create_app(
     @app.get("/video_feed")
     def video_feed():
         def frames():
-            revision = -1
-            while True:
-                next_revision, jpeg = engine.wait_for_frame(revision, timeout_s=2.0)
-                if jpeg is None or next_revision == revision:
-                    if engine.status(None).get("preview_state") == "STOPPED":
-                        break
-                    continue
-                revision = next_revision
+            for jpeg in engine.camera_frames():
                 yield (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
@@ -347,17 +435,73 @@ def create_app(
             mimetype="multipart/x-mixed-replace; boundary=frame",
         )
 
+    @app.get("/api/camera/devices")
+    def camera_devices():
+        client_id()
+        try:
+            names = list_camera_names()
+        except (OSError, RuntimeError) as exc:
+            abort(503, str(exc))
+        return jsonify(ok=True, devices=[{"name": name} for name in names])
+
+    @app.post("/api/camera/connect")
+    def connect_camera():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        name = payload.get("name", "") if isinstance(payload, dict) else None
+        if not isinstance(name, str) or len(name) > 255 or any(ord(char) < 32 for char in name):
+            abort(400, "相机名称格式不正确。")
+        return jsonify(engine.connect_camera(name, client_id=operator))
+
+    @app.post("/api/camera/disconnect")
+    def disconnect_camera():
+        require_operator()
+        return jsonify(engine.disconnect_camera())
+
     @app.post("/api/connect")
     def connect_robot():
         operator = require_operator()
         payload = request.get_json(silent=True) or {}
+        command = {"confirmation": str(payload.get("confirmation", ""))}
+        if "port" in payload:
+            command["port"] = payload["port"]
         return jsonify(
             engine.submit(
                 "connect",
-                {"confirmation": str(payload.get("confirmation", ""))},
+                command,
                 client_id=operator,
             )
         )
+
+    @app.get("/api/teach/status")
+    def teach_status():
+        client_id()
+        return jsonify(ok=True, **engine.teach_status())
+
+    @app.post("/api/teach/<path:operation>")
+    def teach_operation(operation: str):
+        if operation not in {
+            "calibration/start", "calibration/middle", "calibration/range",
+            "calibration/save", "calibration/cancel", "recording/start", "recording/stop",
+        }:
+            abort(404)
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if payload is not None and not isinstance(payload, dict):
+            abort(400, "Expected a JSON object.")
+        command = "teach_" + operation.replace("/", "_")
+        result = engine.submit(command, payload, client_id=operator)
+        recording = result.get("recording")
+        if operation == "recording/stop" and recording and recording.get("id"):
+            try:
+                action = action_library.save_recording(recording)
+            except DeletedActionError as exc:
+                abort(410, str(exc))
+            except (KeyError, ValueError, OSError):
+                LOGGER.exception("could not save teach recording | id=%s", recording["id"])
+                abort(503, "录制已结束，保存 JSON 失败。请检查项目目录后再次取回录制。")
+            result["action"] = {key: action[key] for key in ("id", "name", "description")}
+        return jsonify(result)
 
     @app.post("/api/neutral")
     def collect_neutral():
@@ -368,10 +512,13 @@ def create_app(
     def start_base_calibration():
         operator = require_operator()
         payload = request.get_json(silent=True) or {}
+        command = {"confirmation": str(payload.get("confirmation", ""))}
+        if "port" in payload:
+            command["port"] = payload["port"]
         return jsonify(
             engine.submit(
                 "start_base_calibration",
-                {"confirmation": str(payload.get("confirmation", ""))},
+                command,
                 client_id=operator,
             )
         )
@@ -473,8 +620,11 @@ def create_app(
     @app.post("/api/disarm")
     @app.post("/api/stop")
     def disarm_robot():
-        require_operator()
-        agent_stop("operator pressed stop-following")
+        operator = require_operator()
+        with agent_request_gate:
+            accept_sequence(operator, request.get_json(silent=True) or {}, stop=True)
+            interruptions.pop(operator, None)
+            agent_stop("operator pressed stop-following")
         return jsonify(
             ok=True,
             message="Following stopped. This STOP action did not request torque release.",
@@ -529,6 +679,7 @@ def create_app(
                 base_url=str(payload.get("base_url", "")),
                 model=str(payload.get("model", "")),
                 voice=None if "voice" not in payload else str(payload["voice"]),
+                language=payload.get("language"),
                 api_key=(
                     None
                     if "api_key" not in payload
@@ -540,7 +691,7 @@ def create_app(
         return jsonify(
             ok=True,
             settings=settings,
-            message="名称、API 地址、模型和音色已保存；API Key 仅保存在本次后端进程内存中。",
+            message="名称、API 地址、模型、语言和音色已保存。API Key 仅保存在本次后端进程内存中。",
         )
 
     @app.post("/api/agent/test-connection")
@@ -552,6 +703,7 @@ def create_app(
                 agent_name=str(payload.get("agent_name", "")),
                 base_url=str(payload.get("base_url", "")),
                 model=str(payload.get("model", "")),
+                language=payload.get("language"),
                 api_key=(
                     None
                     if "api_key" not in payload
@@ -571,31 +723,100 @@ def create_app(
     def send_agent_message():
         operator = require_operator()
         payload = request.get_json(silent=True) or {}
+        if not isinstance(payload, dict):
+            abort(400, "消息必须是JSON对象。")
         text = payload.get("text", "")
         if not isinstance(text, str):
             abort(400, "text must be a string.")
+        language = payload.get("language")
+        if language is not None and language not in ("zh", "en"):
+            abort(400, "语言必须选择中文或 English。")
         try:
-            # Speech completion does not imply physical motion completion.
-            # Do not pay for/prepare another gesture while one is returning.
-            # STOP must always bypass this guard.
-            if (
-                engine.status(operator).get("agent_motion", {}).get("active")
-                and not normalize_speech(text).emergency_stop
-            ):
-                LOGGER.info("agent request deferred by active motion | new_request_not_queued=true")
-                abort(409, "上一个机械臂动作仍在执行或回位，请完成后再发送，或先点击停止。")
-            queued = agent_service.submit_text(
-                text,
-                context={
+            with agent_request_gate:
+                accept_sequence(operator, payload)
+                cached = interruptions.pop(operator, None)
+                if cached is not None and time.monotonic() - cached["created_at"] > 15.0:
+                    cached = None
+                active = engine.status(operator).get("agent_motion", {}).get("active")
+                should_interrupt = bool(payload.get("interrupt") or cached or active)
+                if should_interrupt:
+                    interruption = cached or preempt_interaction(operator)
+                else:
+                    interruption = {}
+                context = {
                     "client_id": operator,
                     "source": str(payload.get("source", "text")),
+                    "language": language,
                     "defer_motion": payload.get("defer_motion") is True,
-                },
-            )
+                    "client_sequence": payload.get("client_sequence"),
+                    "interrupt": should_interrupt, "interrupt_handled": should_interrupt,
+                    "interruption": interruption.get("context"),
+                    "resume_motion": interruption.get("resume"),
+                    "available_actions": lambda: [
+                        {"id": item["id"], "name": item["name"], "description": item.get("description", "")}
+                        for item in action_library.list()
+                        if item.get("compatible")
+                    ],
+                }
+                queued = agent_service.submit_text(text, context=context)
             task = wait_for_agent_task(str(queued["task_id"]))
         except (TypeError, ValueError, RuntimeError, KeyError) as exc:
             abort(409, str(exc))
         return agent_task_response(task)
+
+    @app.post("/api/agent/interrupt")
+    def interrupt_agent_message():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "插话请求必须是JSON对象。")
+        with agent_request_gate:
+            accept_sequence(operator, payload, reserve=True)
+            interruptions[operator] = preempt_interaction(operator)
+        return jsonify(ok=True, message="已暂停旧交互，正在接收补充内容。")
+
+    @app.get("/api/joints")
+    def agent_joint_status():
+        operator = require_operator()
+        return jsonify(engine.agent_joint_status(operator))
+
+    @app.post("/api/joints/move")
+    def move_single_agent_joint():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "关节目标必须是JSON对象。")
+        joint, position = payload.get("joint"), payload.get("position")
+        if not isinstance(joint, str) or joint not in joint_limits()["limits"] or isinstance(position, bool) or not isinstance(position, (int, float)) or not math.isfinite(position):
+            abort(400, "关节名称或目标位置不正确。")
+        low, high = joint_limits()["limits"][joint]
+        if not low <= position <= high:
+            abort(400, "目标超出当前关节安全范围。")
+        if not isinstance(payload.get("return_to_start", False), bool):
+            abort(400, "回位选项必须是布尔值。")
+        with agent_request_gate:
+            accept_sequence(operator, payload)
+            preempt_interaction(operator)
+            interruptions.pop(operator, None)
+            return jsonify(engine.submit("agent_plan_start", {"actions": [{"name": "move_joints", "arguments": {
+                "targets": {joint: position}, "return_to_start": payload.get("return_to_start", False),
+            }}]}, client_id=operator))
+
+    @app.post("/api/actions/<identifier>/execute")
+    def execute_saved_action(identifier):
+        operator = require_operator()
+        try:
+            payload = request.get_json(silent=True) if request.is_json else {}
+            if not isinstance(payload, dict):
+                raise ValueError("动作请求必须是 JSON 对象。")
+            actions = action_library.execution_blocks(identifier, playback=payload.get("playback", "keyframes"))
+            with agent_request_gate:
+                accept_sequence(operator, payload)
+                preempt_interaction(operator)
+                interruptions.pop(operator, None)
+                return jsonify(engine.submit("agent_plan_start", {"actions": actions}, client_id=operator))
+        except (ValueError, KeyError) as error:
+            abort(400, str(error))
 
     @app.post("/api/agent/speech")
     def synthesize_agent_speech():
@@ -603,9 +824,15 @@ def create_app(
         payload = request.get_json(silent=True)
         if not isinstance(payload, dict):
             abort(400, "语音请求必须是JSON对象。")
+        task_id = payload.get("task_id")
+        if task_id is not None and (not isinstance(task_id, str) or not re.fullmatch(r"[0-9a-f]{32}", task_id)):
+            abort(400, "task_id不正确。")
         voice = payload.get("voice", payload.get("preset", "taiwan_female"))
+        language = payload.get("language", agent_service.public_settings().get("language", "zh"))
+        started = time.monotonic()
+        audio = b""
         try:
-            audio = speech_synthesizer.synthesize(payload.get("text", ""), voice)
+            audio = speech_synthesizer.synthesize(payload.get("text", ""), voice, language=language)
         except ValueError as exc:
             abort(400, str(exc))
         except SpeechBusyError as exc:
@@ -616,9 +843,46 @@ def create_app(
             return jsonify(ok=False, error=str(exc)), 503
         except SpeechSynthesisError as exc:
             return jsonify(ok=False, error=str(exc)), 502
+        finally:
+            if task_id is not None:
+                LOGGER.info("agent speech timing | task=%s synthesis_ms=%.0f bytes=%d",
+                            task_id, (time.monotonic() - started) * 1000, len(audio))
         response = Response(audio, mimetype="audio/mpeg")
         response.headers["Content-Length"] = str(len(audio))
         return response
+
+    @app.post("/api/agent/latency")
+    def report_agent_latency():
+        client_id()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "延迟记录必须是JSON对象。")
+        task_id = payload.get("task_id")
+        source = payload.get("source")
+        audio_mode = payload.get("audio_mode")
+        interrupted = payload.get("interrupted", False)
+        autoplay_blocked = payload.get("autoplay_blocked", False)
+        if (not isinstance(task_id, str) or not re.fullmatch(r"[0-9a-f]{32}", task_id)
+                or source not in ("text", "voice")
+                or audio_mode not in (None, "neural", "system", "system_fallback")
+                or type(interrupted) is not bool or type(autoplay_blocked) is not bool):
+            abort(400, "延迟记录格式不正确。")
+        metrics = {}
+        for key in (
+            "recognition_ms", "plan_request_ms", "audio_download_ms", "audio_metadata_ms",
+            "audio_start_ms", "motion_ack_ms",
+        ):
+            value = payload.get(key)
+            if value is None:
+                continue
+            if type(value) not in (int, float) or not 0 <= value <= 600_000:
+                abort(400, "延迟必须为有限的毫秒数。")
+            metrics[key] = round(value)
+        LOGGER.info(
+            "agent browser latency | task=%s source=%s audio=%s interrupted=%s autoplay_blocked=%s metrics=%s",
+            task_id, source, audio_mode, interrupted, autoplay_blocked, metrics,
+        )
+        return jsonify(ok=True)
 
     @app.post("/api/agent/start")
     def start_prepared_agent_motion():
@@ -639,11 +903,44 @@ def create_app(
         try:
             task = agent_service.start_ready(
                 task_id, client_id=operator, speech_duration_s=duration,
+                media_duration_s=payload.get("media_duration_s"), playback_rate=payload.get("playback_rate", 1.0),
             )
             task = wait_for_agent_task(str(task["task_id"]), timeout_s=10.0)
         except (RuntimeError, KeyError, ValueError) as exc:
             abort(409, str(exc))
         return agent_task_response(task)
+
+    @app.post("/api/agent/playback")
+    def update_agent_playback():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            abort(400, "播放进度必须是JSON对象。")
+        task_id = payload.get("task_id")
+        if not isinstance(task_id, str) or not task_id or len(task_id) > 96:
+            abort(400, "task_id不正确。")
+        try:
+            task = agent_service.get_task(task_id)
+        except KeyError:
+            return jsonify(ok=True, accepted=False)
+        # COMPLETED means dispatched, not physically finished.  Bind updates to
+        # the motion epoch returned by that dispatch, not the service state.
+        motion = (task.get("result") or {}).get("agent_motion") or {}
+        motion_id = motion.get("motion_id")
+        if isinstance(motion_id, bool) or not isinstance(motion_id, int):
+            return jsonify(ok=True, accepted=False)
+        try:
+            accepted = engine.update_agent_playback(
+                client_id=operator, motion_id=motion_id,
+                position_s=payload.get("position_s"), duration_s=payload.get("duration_s"),
+                state=payload.get("state"), sequence=payload.get("sequence"),
+                playback_rate=payload.get("playback_rate", 1.0),
+            )
+        except ValueError as exc:
+            abort(400, str(exc))
+        except ControlError as exc:
+            abort(409, str(exc))
+        return jsonify(ok=True, accepted=accepted)
 
     @app.post("/api/agent/confirm")
     def confirm_agent_message():
@@ -659,7 +956,7 @@ def create_app(
 
     @app.post("/api/agent/cancel")
     def cancel_agent_message():
-        require_operator()
+        operator = require_operator()
         payload = request.get_json(silent=True) or {}
         task_id = str(payload.get("task_id", ""))
         discard_only = payload.get("discard_only", False)
@@ -689,7 +986,10 @@ def create_app(
             # retains the normal stop behaviour.
             LOGGER.info("agent pending task discarded | task=%s stop_motion=false", task_id)
             return jsonify(ok=True, message="本条待执行任务已丢弃。", task=cancelled_task)
-        agent_stop("operator cancelled Agent interaction")
+        with agent_request_gate:
+            accept_sequence(operator, payload, stop=True)
+            interruptions.pop(operator, None)
+            agent_stop("operator cancelled Agent interaction")
         return jsonify(
             ok=True,
             message="当前 Agent 交互和机械臂动作已取消。",
@@ -834,6 +1134,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Stopping local control panel...")
     finally:
+        app.extensions["so101_simulation"].shutdown()
+        app.extensions["so101_speech_synthesizer"].cancel_current()
         app.extensions["so101_agent_service"].shutdown()
         engine.shutdown()
         server.server_close()

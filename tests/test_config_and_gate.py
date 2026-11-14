@@ -15,7 +15,7 @@ class ConfigAndGateTest(unittest.TestCase):
         self.assertFalse(args.enable_robot)
 
     def test_default_configuration_covers_six_joints(self):
-        config = load_config("config.json")
+        config = load_config("config.example.json")
         controlled = set(config.mapping.controlled_joints)
         fixed = set(config.mapping.fixed_joints.names)
         self.assertEqual(controlled | fixed, set(ALL_JOINTS))

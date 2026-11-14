@@ -12,12 +12,17 @@
   let busy = false;
   let pendingCommand = null;
   let videoFailed = false;
+  let videoSession = null;
+  let cameraCommand = null;
+  let cameraCommandError = "";
+  let disconnectCameraAfterConnect = false;
   let neutralCountdownTimer = null;
   let neutralCountdownRemaining = 0;
   let armCountdownTimer = null;
   let armCountdownRemaining = 0;
   let armAcquireRemaining = 0;
   let armCountdownPhase = "idle";
+  let followerPortEdited = false;
 
   const elements = {
     globalMessage: byId("globalMessage"),
@@ -26,8 +31,16 @@
     previewBadge: byId("previewBadge"),
     robotBadge: byId("robotBadge"),
     readOnlyNotice: byId("readOnlyNotice"),
+    videoDialog: byId("videoFollowDialog"),
     videoFeed: byId("videoFeed"),
     videoFallback: byId("videoFallback"),
+    videoFallbackTitle: byId("videoFallbackTitle"),
+    cameraForm: byId("cameraForm"),
+    cameraName: byId("cameraName"),
+    cameraDevices: byId("cameraDevices"),
+    cameraConnectButton: byId("cameraConnectButton"),
+    cameraDisconnectButton: byId("cameraDisconnectButton"),
+    cameraStatus: byId("cameraStatus"),
     poseDot: byId("poseDot"),
     poseSummary: byId("poseSummary"),
     frameAge: byId("frameAge"),
@@ -36,6 +49,7 @@
     validStreak: byId("validStreak"),
     sendAge: byId("sendAge"),
     robotIdentity: byId("robotIdentity"),
+    followerPort: byId("followerPort"),
     safeRangeStep: byId("safeRangeStep"),
     safeRangeTestNotice: byId("safeRangeTestNotice"),
     neutralStepIndex: byId("neutralStepIndex"),
@@ -79,7 +93,10 @@
     // tab is duplicated; reusing a stored id would let both tabs share one lease.
     const id = globalThis.crypto?.randomUUID?.() ||
       `client-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-    sessionStorage.setItem(CLIENT_KEY, id);
+    // Robot controls and Agent requests must share this document's identity,
+    // even if browser storage is cleared or unavailable while the page is open.
+    Object.defineProperty(window, "so101ControlClientId", { value: id });
+    try { sessionStorage.setItem(CLIENT_KEY, id); } catch (_error) { /* optional only */ }
     return id;
   }
 
@@ -138,6 +155,7 @@
       state?.operator &&
       state.robot_state === "CONNECTED_DISARMED" &&
       state.preview_state === "RUNNING" &&
+      cameraCommand !== "disconnect" &&
       !state.armed &&
       !state.agent_motion?.active &&
       !state.neutral_collecting &&
@@ -152,6 +170,7 @@
       state?.operator &&
       state.robot_state === "CONNECTED_DISARMED" &&
       state.preview_state === "RUNNING" &&
+      cameraCommand !== "disconnect" &&
       state.neutral_ready &&
       !state.armed &&
       !state.agent_motion?.active &&
@@ -211,7 +230,10 @@
       state.armed ? "ARMED · 正在跟随" : "DISARMED · 未跟随",
       state.armed ? "armed" : "safe",
     );
-    setBadge(elements.previewBadge, previewState, badgeKind(previewState));
+    const previewLabels = {
+      STOPPED: "未连接", STARTING: "连接中", RUNNING: "已连接", STOPPING: "断开中", FAULT: "相机故障",
+    };
+    setBadge(elements.previewBadge, previewLabels[previewState] || previewState, badgeKind(previewState));
     setBadge(elements.robotBadge, robotState, badgeKind(robotState));
 
     elements.readOnlyNotice.hidden = operator;
@@ -244,7 +266,11 @@
     elements.validStreak.textContent = state.valid_streak ?? "—";
     elements.sendAge.textContent = formatAge(state.last_send_age_s);
 
-    elements.robotIdentity.textContent = `${state.robot_id || "SO-101"} · ${state.port || "—"}`;
+    const followerPort = state.robot_port || state.port || "";
+    if (state.robot_connected || (!followerPortEdited && followerPort)) {
+      elements.followerPort.value = followerPort;
+    }
+    elements.robotIdentity.textContent = `${state.robot_id || "SO-101"} · ${followerPort || "—"}`;
     elements.leaseState.textContent = operator
       ? `本页面 · 心跳 ${formatAge(state.lease_age_s)}`
       : `只读 · ${formatAge(state.lease_age_s)}`;
@@ -252,7 +278,7 @@
     elements.previewState.textContent = previewState;
     const camera = state.camera || {};
     elements.cameraConfig.textContent =
-      `#${camera.index ?? "—"} · ${camera.width ?? "—"}×${camera.height ?? "—"} · ${camera.fps ?? "—"} FPS · 校正 ${camera.rotation_degrees ?? 0}°`;
+      `${state.camera_name || `#${camera.index ?? "—"}`} · ${camera.width ?? "—"}×${camera.height ?? "—"} · ${camera.fps ?? "—"} FPS · 校正 ${camera.rotation_degrees ?? 0}°`;
     elements.poseSide.textContent =
       `${state.pose_side === "left" ? "左臂 + 左手" : "右臂 + 右手"} · ${state.control_hz ?? "—"} Hz`;
 
@@ -275,7 +301,7 @@
     elements.baseCalibrationProgressBar.setAttribute("aria-valuenow", String(basePercent));
     const baseMessages = {
       IDLE: "连接失败并提示 calibration mismatch 时，从这里开始",
-      STARTING: "正在打开 COM4 并释放全部六轴扭矩…",
+      STARTING: `正在打开 ${followerPort || "从臂串口"} 并释放全部六轴扭矩…`,
       WAITING_MIDDLE: "六轴已释放：请托住机械臂，摆到各自行程中间，再点击“② 确定当前六轴中位”",
       MIDDLE_CAPTURED: "中位已确定：请托住机械臂，再点击“③ 开始 90 秒范围采集”",
       RECORDING: `正在记录六轴原始范围 · 剩余 ${Math.ceil(baseRemaining)} 秒；请依次移动 ID1–ID6`,
@@ -380,6 +406,8 @@
     }
 
     elements.connectButton.disabled = busy || countdownActive || !operator || !state.can_connect;
+    elements.followerPort.disabled = busy || !operator || Boolean(state.robot_connected) ||
+      baseCalibrationActive || robotState === "CONNECTING" || Boolean(state.teach_active);
     elements.baseCalibrationStartButton.disabled =
       busy || countdownActive || !operator || !state.can_start_base_calibration;
     elements.baseCalibrationMiddleButton.disabled =
@@ -450,7 +478,7 @@
     // STOP remains available for an in-flight ARM, but not after torque release has
     // been confirmed: a release already in progress cannot be cancelled safely.
     elements.stopButton.disabled =
-      !operator || releaseInProgress || (!state.armed && !armPending && !agentMotionActive);
+      !operator || releaseInProgress || (!state.armed && !armPending && !agentMotionActive && !state.teach_following);
     elements.disconnectButton.disabled =
       busy || countdownActive || !operator || !state.can_disconnect;
     elements.connectButton.textContent = robotState === "CONNECTING"
@@ -494,10 +522,62 @@
     renderJoints(Array.isArray(state.joints) ? state.joints : []);
     elements.connectionState.textContent = `后台在线 · 客户端 ${clientId.slice(0, 8)}`;
 
-    if (!videoFailed && previewState === "RUNNING") {
+    if (elements.cameraForm) {
+      renderCamera(state);
+    } else if (!videoFailed && previewState === "RUNNING") {
       elements.videoFallback.hidden = true;
       elements.videoFeed.hidden = false;
     }
+    window.dispatchEvent(new Event("so101:follower-state"));
+  }
+
+  function cameraIsActive(state) {
+    return ["STARTING", "RUNNING"].includes(state?.preview_state);
+  }
+
+  function detachVideo() {
+    elements.videoFeed.removeAttribute("src");
+    elements.videoFeed.hidden = true;
+    elements.videoFallback.hidden = false;
+    videoFailed = false;
+    videoSession = null;
+  }
+
+  function renderCamera(state) {
+    const preview = state?.preview_state || "STOPPED";
+    const active = cameraIsActive(state);
+    const stopping = preview === "STOPPING" || cameraCommand === "disconnect";
+    const starting = preview === "STARTING" || cameraCommand === "connect";
+    const writable = Boolean(state?.operator) && !cameraCommand;
+    const name = (cameraCommand === "connect" ? elements.cameraName.value.trim() : state?.camera_name) || "默认相机";
+    elements.cameraName.disabled = !writable || active || stopping;
+    elements.cameraConnectButton.disabled = elements.cameraName.disabled;
+    elements.cameraDisconnectButton.disabled = !writable || !active || stopping;
+    elements.cameraConnectButton.textContent = starting ? "正在连接…" : "连接视频";
+    elements.cameraDisconnectButton.textContent = stopping ? "正在断开…" : "断开视频";
+
+    const status = stopping ? "正在释放相机…" : starting ? `正在打开 ${name}…` :
+      preview === "RUNNING" ? `${name} 已连接。${state?.operator ? "关闭此窗口也会断开相机。" : ""}` :
+      "填写设备管理器中的相机名称，留空使用默认相机。";
+    const error = cameraCommandError || (preview === "FAULT" ? state?.preview_error || "相机无法连接。" : "");
+    if (elements.cameraStatus.textContent !== (error || status)) elements.cameraStatus.textContent = error || status;
+    elements.cameraStatus.classList.toggle("is-error", Boolean(error));
+
+    if (elements.videoDialog.open && preview === "RUNNING" && !stopping) {
+      const session = String(state.camera_session ?? "current");
+      if (videoSession !== session || !elements.videoFeed.hasAttribute("src")) {
+        videoFailed = false;
+        videoSession = session;
+        elements.videoFeed.src = `/video_feed?session=${encodeURIComponent(session)}`;
+      }
+      elements.videoFeed.hidden = videoFailed;
+      elements.videoFallback.hidden = !videoFailed;
+      elements.videoFallbackTitle.textContent = "画面加载失败，请断开后重连";
+      return;
+    }
+    detachVideo();
+    elements.videoFallbackTitle.textContent = stopping ? "正在断开视频…" :
+      starting ? "正在等待相机画面…" : preview === "FAULT" ? "相机连接失败" : "相机未连接";
   }
 
   function renderJoints(joints) {
@@ -525,7 +605,7 @@
       const roleCell = document.createElement("td");
       const role = document.createElement("span");
       role.className = `role-pill ${joint.role === "fixed" ? "role-fixed" : "role-moving"}`;
-      role.textContent = joint.role === "fixed" ? "固定保持" : "人体跟随";
+      role.textContent = joint.role === "fixed" ? "视频固定 · Agent可用" : "视频跟随 · Agent可用";
       roleCell.append(role);
 
       const mappingCell = document.createElement("td");
@@ -620,6 +700,51 @@
     return payload;
   }
 
+  async function refreshCameraDevices() {
+    try {
+      const { devices } = await api("/api/camera/devices");
+      if (!Array.isArray(devices)) return;
+      const names = new Set(devices.map((device) => device?.name).filter((name) => typeof name === "string" && name));
+      elements.cameraDevices.replaceChildren(...[...names].map((name) => new Option(name)));
+    } catch (_error) {
+      // Device suggestions are optional. The name can still be entered manually.
+    }
+  }
+
+  async function requestCamera(action) {
+    if (!currentState?.operator || cameraCommand) return;
+    cameraCommand = action;
+    cameraCommandError = "";
+    if (action === "disconnect") {
+      cancelNeutralCountdown(false);
+      cancelArmCountdown(false);
+    }
+    render(currentState);
+    try {
+      const payload = action === "connect" ? { name: elements.cameraName.value.trim() } : {};
+      const result = await api(`/api/camera/${action}`, { method: "POST", body: JSON.stringify(payload) });
+      if (result.preview_state) {
+        currentState = {
+          ...currentState,
+          preview_state: result.preview_state,
+          preview_error: result.preview_error,
+          camera_name: result.camera_name,
+          camera_session: result.camera_session ?? currentState.camera_session,
+        };
+      }
+    } catch (error) {
+      cameraCommandError = error.message;
+    } finally {
+      cameraCommand = null;
+      render(currentState);
+      if (action === "connect" && disconnectCameraAfterConnect) {
+        disconnectCameraAfterConnect = false;
+        if (!elements.videoDialog.open) void requestCamera("disconnect");
+      }
+      void pollStatus(true);
+    }
+  }
+
   async function pollStatus(forceFresh = false) {
     if (pollingPromise) {
       await pollingPromise;
@@ -636,6 +761,11 @@
       elements.globalMessage.textContent = `无法读取后台状态：${error.message}`;
       elements.globalMessage.classList.add("is-error");
       disableAllControls();
+      if (elements.cameraForm) {
+        detachVideo();
+        elements.videoFallbackTitle.textContent = "无法读取相机状态";
+      }
+      window.dispatchEvent(new Event("so101:follower-state"));
     }
     })();
     pollingPromise = request;
@@ -669,6 +799,7 @@
         elements.globalMessage.classList.add("is-error");
       }
     }
+    return commandError;
   }
 
   async function stopFollowing() {
@@ -676,7 +807,8 @@
     elements.stopButton.disabled = true;
     elements.globalMessage.textContent = "正在停止跟随…";
     try {
-      const result = await api("/api/disarm", { method: "POST" });
+      const sequence = window.so101InvalidateInteraction?.();
+      const result = await api("/api/disarm", { method: "POST", body: JSON.stringify({ client_sequence: sequence }) });
       await pollStatus(true);
       elements.globalMessage.textContent = result.message || "已停止跟随；本次命令未请求释放扭矩";
       elements.globalMessage.classList.remove("is-error", "is-armed");
@@ -688,6 +820,7 @@
 
   function disableAllControls() {
     [
+      elements.followerPort,
       elements.connectButton,
       elements.baseCalibrationStartButton,
       elements.baseCalibrationMiddleButton,
@@ -702,7 +835,10 @@
       elements.armButton,
       elements.stopButton,
       elements.disconnectButton,
-    ].forEach((button) => { button.disabled = true; });
+      elements.cameraName,
+      elements.cameraConnectButton,
+      elements.cameraDisconnectButton,
+    ].forEach((button) => { if (button) button.disabled = true; });
   }
 
   function showNeutralCountdownMessage() {
@@ -860,10 +996,50 @@
     updateArmCountdownDisplay();
   }
 
-  elements.baseCalibrationStartButton.addEventListener("click", () => {
-    runCommand("/api/base-calibration/start", {
+  function runFollowerCommand(operation) {
+    const paths = {
+      connect: "/api/connect",
+      "calibration/start": "/api/base-calibration/start",
+      "calibration/middle": "/api/base-calibration/middle",
+      "calibration/range": "/api/base-calibration/range/start",
+      "calibration/save": "/api/base-calibration/finish",
+      "calibration/cancel": "/api/base-calibration/cancel",
+    };
+    const path = paths[operation];
+    if (!path) return Promise.resolve("未知的从臂操作。");
+    if (busy) return Promise.resolve("正在处理上一条机器人命令。");
+    const port = elements.followerPort.value.trim();
+    const needsPort = operation === "connect" || operation === "calibration/start";
+    if (needsPort && !port) {
+      const error = "请填写从臂串口。";
+      elements.globalMessage.textContent = error;
+      elements.globalMessage.classList.add("is-error");
+      return Promise.resolve(error);
+    }
+    return runCommand(path, operation === "calibration/cancel" ? null : {
       confirmation: CONTROL_CONFIRMATION_CODE,
+      ...(needsPort ? { port } : {}),
     });
+  }
+
+  function setFollowerPort(port) {
+    if (elements.followerPort.disabled) return;
+    elements.followerPort.value = port;
+    followerPortEdited = true;
+    window.dispatchEvent(new Event("so101:follower-state"));
+  }
+
+  window.so101FollowerControl = {
+    get state() { return currentState; },
+    get port() { return elements.followerPort.value; },
+    get portDisabled() { return elements.followerPort.disabled; },
+    setPort: setFollowerPort,
+    run: runFollowerCommand,
+  };
+  elements.followerPort.addEventListener("input", () => setFollowerPort(elements.followerPort.value));
+
+  elements.baseCalibrationStartButton.addEventListener("click", () => {
+    void runFollowerCommand("calibration/start");
   });
 
   elements.baseCalibrationMiddleButton.addEventListener("click", () => {
@@ -889,7 +1065,7 @@
   });
 
   elements.connectButton.addEventListener("click", () => {
-    runCommand("/api/connect", { confirmation: CONTROL_CONFIRMATION_CODE });
+    void runFollowerCommand("connect");
   });
 
   elements.fixedButton.addEventListener("click", () => {
@@ -933,13 +1109,44 @@
     });
   });
 
+  if (elements.cameraForm) {
+    elements.cameraName.addEventListener("input", () => {
+      cameraCommandError = "";
+      renderCamera(currentState);
+    });
+    elements.cameraForm.addEventListener("submit", (event) => {
+      event.preventDefault();
+      if (!elements.cameraConnectButton.disabled) void requestCamera("connect");
+    });
+    elements.cameraDisconnectButton.addEventListener("click", () => void requestCamera("disconnect"));
+    byId("openVideoFollowButton").addEventListener("click", () => {
+      void refreshCameraDevices();
+      queueMicrotask(() => renderCamera(currentState));
+    });
+    elements.videoDialog.addEventListener("close", () => {
+      detachVideo();
+      if (!currentState?.operator) return;
+      if (cameraCommand === "connect") {
+        disconnectCameraAfterConnect = true;
+      } else if (cameraIsActive(currentState)) {
+        void requestCamera("disconnect");
+      }
+    });
+    window.addEventListener("pagehide", () => {
+      if (!currentState?.operator || !(cameraIsActive(currentState) || cameraCommand === "connect")) return;
+      void api("/api/camera/disconnect", { method: "POST", body: "{}", keepalive: true }).catch(() => {});
+    });
+  }
+
   elements.videoFeed.addEventListener("load", () => {
+    if (elements.cameraForm && (!elements.videoDialog.open || !elements.videoFeed.hasAttribute("src"))) return;
     videoFailed = false;
     elements.videoFallback.hidden = true;
     elements.videoFeed.hidden = false;
   });
 
   elements.videoFeed.addEventListener("error", () => {
+    if (elements.cameraForm && (!elements.videoDialog.open || !elements.videoFeed.hasAttribute("src"))) return;
     videoFailed = true;
     elements.videoFeed.hidden = true;
     elements.videoFallback.hidden = false;
@@ -972,7 +1179,8 @@
     }
     fetch("/api/disarm", {
       method: "POST",
-      headers: { "X-Client-Id": clientId },
+      headers: { "X-Client-Id": clientId, "Content-Type": "application/json" },
+      body: JSON.stringify({ client_sequence: window.so101InvalidateInteraction?.() }),
       credentials: "same-origin",
       keepalive: true,
       cache: "no-store",
