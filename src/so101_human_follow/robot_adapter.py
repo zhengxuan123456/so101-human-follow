@@ -5,6 +5,8 @@ import json
 import logging
 import math
 import sys
+from collections.abc import Mapping
+from numbers import Integral
 from pathlib import Path
 from typing import Any, Callable
 
@@ -12,6 +14,21 @@ from .config import ALL_JOINTS, RobotSettings
 
 
 LOGGER = logging.getLogger("so101_human_follow.control")
+
+
+class CalibrationRangeError(ValueError):
+    """An automatic command selected axes whose raw feedback is out of range."""
+
+    def __init__(self, observation: dict[str, Any], joints: tuple[str, ...]):
+        self.observation = observation
+        self.joints = tuple(joints)
+        details = "; ".join(
+            f"{joint}: raw {observation['raw_positions'][joint]} outside "
+            f"{observation['raw_limits'][joint]}" for joint in self.joints
+        )
+        super().__init__(
+            "Refusing automatic movement or hold outside calibrated raw travel: " + details
+        )
 
 
 def _make_lerobot_importable() -> None:
@@ -33,11 +50,13 @@ class SO101RobotAdapter:
         self.settings = settings
         self.robot: Any | None = None
         self.connected = False
+        self._verified_calibration_fingerprint: str | None = None
         self.manual_range_active = False
         self.fixed_positioning_active = False
         self._fixed_positioning_motors: tuple[str, ...] = ()
 
     def connect(self) -> dict[str, float]:
+        self._verified_calibration_fingerprint = None
         _make_lerobot_importable()
         from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 
@@ -70,6 +89,7 @@ class SO101RobotAdapter:
                     "Motor calibration does not match the saved JSON. "
                     f"Differences: {detail}. Refusing motion; run calibration again."
                 )
+            self._verified_calibration_fingerprint = self.calibration_fingerprint()
             return self.read_positions()
         except Exception:
             self._cleanup_partial_connection()
@@ -107,6 +127,7 @@ class SO101RobotAdapter:
         return differences
 
     def _cleanup_partial_connection(self) -> None:
+        self._verified_calibration_fingerprint = None
         if self.robot is None:
             self.connected = False
             return
@@ -142,6 +163,131 @@ class SO101RobotAdapter:
             f"{name}.pos": (int(calibration.range_min), int(calibration.range_max))
             for name, calibration in self.robot.calibration.items()
         }
+
+    def read_calibration_observation(self) -> dict[str, Any]:
+        """Read one raw position batch and normalize that same batch locally.
+
+        Call only from the existing serial owner, like ``read_positions``. On
+        Feetech, ``sync_read(..., normalize=False)`` retains the SDK's register
+        decoding (STS3215 Present_Position has no signed conversion). Its homed
+        Present_Position is the same coordinate used by
+        LeRobot's raw range capture; do not apply homing or drive mode twice.
+        ``bus._normalize`` applies the saved drive mode and clips raw readings
+        to that range. ``clipped_joints`` therefore remains essential evidence:
+        a clipped normalized endpoint is not an in-range encoder observation.
+        Calibration metadata is cached and already verified at connection;
+        this method never reads EEPROM, writes goals, or changes torque.
+        """
+        normalized_limits = self.normalized_joint_limits()
+        robot = self.robot
+        bus = robot.bus
+        if getattr(bus, "apply_drive_mode", None) is not True:
+            raise RuntimeError("Raw calibration observation requires Feetech drive-mode normalization.")
+        fingerprint = self._verified_calibration_fingerprint
+        raw_limits = self.calibration_ranges()
+        names = [joint.removesuffix(".pos") for joint in ALL_JOINTS]
+        ids = {name: int(bus.motors[name].id) for name in names}
+        if len(set(ids.values())) != len(ALL_JOINTS):
+            raise RuntimeError("Raw calibration observation requires six distinct motor IDs.")
+        try:
+            # One group-read attempt, without a second get_observation() sample.
+            raw_values = bus.sync_read("Present_Position", names, normalize=False, num_retry=0)
+        except Exception as exc:
+            raise RuntimeError(f"Could not read raw calibration positions: {exc}") from exc
+        if not isinstance(raw_values, Mapping) or set(raw_values) != set(names):
+            raise RuntimeError("Raw calibration observation is missing the complete six-joint sample.")
+        if any(isinstance(value, bool) or not isinstance(value, Integral) for value in raw_values.values()):
+            raise RuntimeError("Raw calibration observation must contain integer encoder positions.")
+        raw_positions = {f"{name}.pos": int(raw_values[name]) for name in names}
+        try:
+            normalized = bus._normalize({ids[name]: int(raw_values[name]) for name in names})
+        except Exception as exc:
+            raise RuntimeError(f"Could not normalize raw calibration positions: {exc}") from exc
+        if not isinstance(normalized, Mapping) or set(normalized) != set(ids.values()):
+            raise RuntimeError("Raw calibration normalization returned an incomplete six-joint sample.")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float))
+               or not math.isfinite(value) for value in normalized.values()):
+            raise RuntimeError("Raw calibration normalization returned a non-finite or invalid position.")
+        # The I/O call may have yielded. Never combine a raw sample with a
+        # different cached calibration, normalization mode, or motor bus.
+        if (self.robot is not robot or robot.bus is not bus
+                or getattr(bus, "apply_drive_mode", None) is not True
+                or self._verified_calibration_fingerprint != fingerprint
+                or self.normalized_joint_limits() != normalized_limits):
+            raise RuntimeError("Motor calibration or normalization changed during the raw position read.")
+        positions = {f"{name}.pos": float(normalized[ids[name]]) for name in names}
+        in_range = {
+            joint: raw_limits[joint][0] <= raw_positions[joint] <= raw_limits[joint][1]
+            for joint in ALL_JOINTS
+        }
+        return {
+            "positions": positions,
+            "raw_positions": raw_positions,
+            "raw_limits": raw_limits,
+            "normalized_limits": normalized_limits,
+            "in_range": in_range,
+            "clipped_joints": tuple(joint for joint in ALL_JOINTS if not in_range[joint]),
+            "calibration_fingerprint": fingerprint,
+        }
+
+    def normalized_joint_limits(self) -> dict[str, tuple[float, float]]:
+        """Read calibrated bus normalization bounds, without any serial I/O.
+
+        Connection already checked EEPROM against saved calibration. Do not call
+        ``is_calibrated`` here: LeRobot's Feetech property performs serial reads.
+        These are calibrated motor travel bounds, not collision-free workspace
+        limits; companion control must retain its smaller relative envelope.
+        """
+        if not self.connected or self.robot is None or self._verified_calibration_fingerprint is None:
+            raise RuntimeError("Robot must be connected with verified calibration before reading motor limits.")
+        bus = getattr(self.robot, "bus", None)
+        if bus is None or getattr(bus, "is_connected", False) is not True:
+            raise RuntimeError("The calibrated motor bus is not connected.")
+        try:
+            fingerprint = self.calibration_fingerprint()
+        except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+            raise RuntimeError("Motor calibration is incomplete or invalid.") from exc
+        if fingerprint != self._verified_calibration_fingerprint:
+            raise RuntimeError("Motor calibration changed after connection; reconnect before companion motion.")
+        motors = getattr(bus, "motors", {})
+        calibrated = getattr(bus, "calibration", {})
+        saved = self.robot.calibration
+        if not all(isinstance(value, Mapping) for value in (motors, calibrated, saved)):
+            raise RuntimeError("Calibrated motor definitions are unavailable.")
+        _make_lerobot_importable()
+        from lerobot.motors import MotorNormMode
+
+        result = {}
+        for joint in ALL_JOINTS:
+            motor_name = joint.removesuffix(".pos")
+            motor = motors.get(motor_name)
+            calibration = calibrated.get(motor_name)
+            reference = saved.get(motor_name)
+            if motor is None or calibration is None or reference is None:
+                raise RuntimeError(f"Missing calibrated motor definition: {motor_name}.")
+            try:
+                fields = ("id", "drive_mode", "homing_offset", "range_min", "range_max")
+                current_values = tuple(int(getattr(calibration, name)) for name in fields)
+                saved_values = tuple(int(getattr(reference, name)) for name in fields)
+                low, high = float(calibration.range_min), float(calibration.range_max)
+                if (current_values != saved_values or int(motor.id) != current_values[0]
+                        or not math.isfinite(low + high) or not 0 <= low < high < (1 << 15)
+                        or any(float(getattr(calibration, name)) != value for name, value in zip(fields, current_values))
+                        or any(float(getattr(reference, name)) != value for name, value in zip(fields, saved_values))
+                        or current_values[1] not in (0, 1)):
+                    raise ValueError("Calibration is incomplete, changed, or has invalid raw travel.")
+            except (AttributeError, TypeError, ValueError, OverflowError) as exc:
+                raise RuntimeError(f"Invalid calibrated motor limits for {motor_name}: {exc}") from exc
+            # Identity matches LeRobot _normalize/_unnormalize, which also use
+            # enum identity. A similar string, degrees, or radians is unsupported.
+            mode = getattr(motor, "norm_mode", None)
+            if mode is MotorNormMode.RANGE_M100_100:
+                result[joint] = (-100.0, 100.0)
+            elif mode is MotorNormMode.RANGE_0_100:
+                result[joint] = (0.0, 100.0)
+            else:
+                raise RuntimeError(f"Unsupported motor normalization for {motor_name}: {mode!r}.")
+        return result
 
     def calibration_fingerprint(self) -> str:
         if self.robot is None or not self.robot.calibration:
@@ -337,8 +483,15 @@ class SO101RobotAdapter:
     def send_agent_targets(
         self, action: dict[str, float], active_joints: tuple[str, ...],
         fixed_positions: dict[str, float],
+        *, before_write: Callable[[dict[str, float]], bool] | None = None,
+        verify_calibrated_raw: bool = False,
+        raw_guard_joints: tuple[str, ...] = (),
     ) -> tuple[dict[str, float], dict[str, float]]:
-        """Write selected Agent axes plus encoder-seeded holds for inactive axes."""
+        """Write selected axes, optionally guarding additional axes in the raw sample.
+
+        Raw guards can protect a multi-axis calibration while only one axis is
+        probed. They are checked with the selected axes but never receive goals.
+        """
         if not self.connected or self.robot is None:
             raise RuntimeError("Robot is not connected.")
         if self.manual_range_active or self.fixed_positioning_active:
@@ -350,7 +503,29 @@ class SO101RobotAdapter:
             raise ValueError("An active Agent joint cannot also be held fixed.")
         if not selected <= set(ALL_JOINTS):
             raise ValueError("Agent requested an unknown joint.")
-        observed = self.read_positions()
+        if type(verify_calibrated_raw) is not bool:
+            raise ValueError("verify_calibrated_raw must be a boolean.")
+        if not isinstance(raw_guard_joints, (tuple, list)) or any(
+            not isinstance(joint, str) for joint in raw_guard_joints
+        ):
+            raise ValueError("Raw guard joints must be a tuple or list of joint names.")
+        guarded = set(raw_guard_joints)
+        if len(guarded) != len(raw_guard_joints):
+            raise ValueError("Raw guard listed one joint more than once.")
+        if not guarded <= set(ALL_JOINTS):
+            raise ValueError("Raw guard requested an unknown joint.")
+        if guarded and not verify_calibrated_raw:
+            raise ValueError("Raw guard joints require verify_calibrated_raw=True.")
+        if verify_calibrated_raw:
+            observation = self.read_calibration_observation()
+            clipped = (selected | guarded) & set(observation["clipped_joints"])
+            if clipped:
+                raise CalibrationRangeError(
+                    observation, tuple(joint for joint in ALL_JOINTS if joint in clipped),
+                )
+            observed = observation["positions"]
+        else:
+            observed = self.read_positions()
         goals = {
             joint.removesuffix(".pos"): float(fixed_positions[joint] if joint in fixed_positions else action[joint])
             for joint in selected
@@ -364,6 +539,8 @@ class SO101RobotAdapter:
         goals = ensure_safe_goal_position(
             {motor: (goal, observed[f"{motor}.pos"]) for motor, goal in goals.items()}, caps,
         )
+        if before_write is not None and not before_write(observed):
+            return dict(observed), observed
         if goals:
             self.robot.bus.sync_write("Goal_Position", goals)
         sent = dict(observed)
@@ -381,6 +558,28 @@ class SO101RobotAdapter:
             "Goal_Position", {joint.removesuffix(".pos"): value for joint, value in observed.items()}
         )
         return observed
+
+    def hold_raw_current(self) -> dict[str, float]:
+        """Hold the actual encoder pose even if normalization would clip it.
+
+        Feetech Present_Position and Goal_Position use the same homed raw
+        coordinate. ``normalize=False`` skips LeRobot's inverse normalization,
+        so the SDK writes the sampled encoder values rather than replacing an
+        out-of-recording-range pose with a calibrated endpoint. Its ordinary
+        register encoding still applies. This is a hold, not an automatic
+        return into the recorded range, and never changes torque/calibration.
+        """
+        if not self.connected or self.robot is None:
+            raise RuntimeError("Robot is not connected.")
+        if self.manual_range_active or self.fixed_positioning_active:
+            raise RuntimeError("Cannot seed a powered hold during manual positioning.")
+        observation = self.read_calibration_observation()
+        self.robot.bus.sync_write(
+            "Goal_Position",
+            {joint.removesuffix(".pos"): observation["raw_positions"][joint] for joint in ALL_JOINTS},
+            normalize=False, num_retry=0,
+        )
+        return dict(observation["positions"])
 
 
 class SO101CalibrationSession:

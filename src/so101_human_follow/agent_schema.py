@@ -247,6 +247,15 @@ def build_fixed_intent_plan(text: str, *, language: str = "zh", agent_name: str 
         "return to home": "返回原位", "go home": "返回原位",
     }
     compact = english_aliases.get(english, "".join(str(text).split()).strip("，。！!,.、；;"))
+    if compact in {"开始跟随", "开始人体跟随", "启动人体跟随"} or english in {
+        "start following", "start human follow",
+    }:
+        return InteractionPlan(
+            version=PLAN_VERSION,
+            reply="Confirm to start human following." if language == "en" else "请确认启动人体跟随。",
+            actions=(AgentAction("start_human_follow", {}),),
+            requires_confirmation=True,
+        )
     commands = {
         "你好": "perform_greeting",
         "你好呀": "perform_greeting",

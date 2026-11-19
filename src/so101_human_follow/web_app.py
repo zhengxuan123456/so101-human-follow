@@ -34,7 +34,7 @@ from .speech_synthesis import (
     SpeechTimeoutError,
     SpeechUnavailableError,
 )
-from .web_engine import CONTROL_CONFIRMATION_CODE, ControlEngine, ControlError
+from .web_engine import AGENT_INTERACTION_PREEMPT_REASON, CONTROL_CONFIRMATION_CODE, ControlEngine, ControlError
 
 
 COOKIE_NAME = "so101_control"
@@ -333,7 +333,7 @@ def create_app(
         if resume is None:
             resume = agent_service.interruption_resume(operator)
         context = agent_service.interruption_context(operator, execution_snapshot=snapshot)
-        agent_stop("new utterance interrupted the previous interaction")
+        agent_stop(AGENT_INTERACTION_PREEMPT_REASON)
         if snapshot.get("state") in {"RUNNING", "RETURNING", "PAUSED"}:
             engine.submit("agent_interrupt_hold", client_id=operator, timeout_s=3.0)
         return {"context": context, "resume": resume, "created_at": time.monotonic()}
@@ -417,6 +417,43 @@ def create_app(
         value = client_id()
         engine.heartbeat(value)
         return jsonify(ok=True, **engine.status(value))
+
+    @app.post("/api/companion")
+    def update_companion():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict) or type(payload.get("enabled")) is not bool:
+            abort(400, "陪伴模式开关需要布尔值。")
+        allow_unoccupied_idle = payload.get("allow_unoccupied_idle", False)
+        allow_vertical_search = payload.get("allow_vertical_search", False)
+        expected_epoch = payload.get("expected_epoch")
+        if type(allow_unoccupied_idle) is not bool or type(allow_vertical_search) is not bool:
+            abort(400, "无人搜索选项需要布尔值。")
+        if payload["enabled"] and (type(expected_epoch) is not int or expected_epoch < 0):
+            abort(400, "请刷新控制状态后开启陪伴模式。")
+        return jsonify(engine.set_companion(
+            client_id=operator, enabled=payload["enabled"], allow_unoccupied_idle=allow_unoccupied_idle,
+            allow_vertical_search=allow_vertical_search,
+            expected_epoch=expected_epoch,
+        ))
+
+    @app.post("/api/gaze/calibrate")
+    def calibrate_gaze():
+        operator = require_operator()
+        payload = request.get_json(silent=True)
+        if (not isinstance(payload, dict) or not isinstance(payload.get("action"), str)
+                or payload["action"] not in {"start", "cancel"}):
+            abort(400, "注视标定操作必须是 start 或 cancel。")
+        epoch = payload.get("expected_epoch")
+        if payload["action"] == "start" and (type(epoch) is not int or epoch < 0):
+            abort(400, "请刷新控制状态后启动注视标定。")
+        confirmation = payload.get("confirmation", "")
+        if not isinstance(confirmation, str):
+            abort(400, "注视标定确认字段无效。")
+        return jsonify(engine.request_gaze_calibration(
+            client_id=operator, action=payload["action"], expected_epoch=epoch,
+            confirmation=confirmation,
+        ))
 
     @app.get("/video_feed")
     def video_feed():

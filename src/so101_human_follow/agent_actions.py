@@ -40,6 +40,8 @@ SHOULDER_SLOW_SIZE = 0.42
 SHOULDER_STOP_SIZE = 0.62
 PALM_SLOW_SIZE = 0.16
 PALM_STOP_SIZE = 0.24
+HEAD_SLOW_SIZE = 0.40
+HEAD_STOP_SIZE = 0.60
 
 ALLOWED_AGENT_ACTIONS = frozenset(
     {
@@ -69,6 +71,7 @@ class VisualProximity:
     reason: str
     shoulder_size: float | None = None
     palm_size: float | None = None
+    head_size: float | None = None
 
 
 @dataclass(frozen=True)
@@ -380,9 +383,8 @@ def estimate_visual_proximity(
     """Return a conservative apparent-size proximity state for an RGB camera.
 
     This intentionally never claims a centimetre distance.  With one ordinary
-    camera, apparent shoulder/palm size is suitable only as an additional stop
-    guard.  Missing or unreliable scale data remains UNKNOWN and therefore
-    prevents a new Agent motion from starting.
+    camera, apparent shoulder/palm/head size is suitable only as an additional
+    stop guard. Missing or unreliable scale data remains UNKNOWN.
     """
 
     if not math.isfinite(aspect_ratio) or aspect_ratio <= 0.0:
@@ -417,16 +419,36 @@ def estimate_visual_proximity(
         if math.isfinite(value) and value >= 0.015:
             palm_size = value
 
-    if shoulder_size is None and palm_size is None:
+    head_size: float | None = None
+    box = getattr(detection, "head_box", None)
+    center = getattr(detection, "head_center", None)
+    confidence = getattr(detection, "head_confidence", 0.0)
+    if box is not None and center is not None:
+        try:
+            left, top, right, bottom = map(float, box)
+            x, y = map(float, center)
+            if (math.isfinite(float(confidence)) and 0.55 <= float(confidence) <= 1.0
+                    and all(math.isfinite(value) for value in (left, top, right, bottom, x, y))
+                    and 0.0 <= left < right <= 1.0 and 0.0 <= top < bottom <= 1.0
+                    and left <= x <= right and top <= y <= bottom):
+                size = max((right - left) * aspect_ratio, bottom - top)
+                if size >= 0.04:
+                    head_size = size
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    if shoulder_size is None and palm_size is None and head_size is None:
         return VisualProximity("UNKNOWN", "no reliable visual scale")
 
     too_close = bool(
         (shoulder_size is not None and shoulder_size >= SHOULDER_STOP_SIZE)
         or (palm_size is not None and palm_size >= PALM_STOP_SIZE)
+        or (head_size is not None and head_size >= HEAD_STOP_SIZE)
     )
     slow = bool(
         (shoulder_size is not None and shoulder_size >= SHOULDER_SLOW_SIZE)
         or (palm_size is not None and palm_size >= PALM_SLOW_SIZE)
+        or (head_size is not None and head_size >= HEAD_SLOW_SIZE)
     )
     if too_close:
         state, reason = "TOO_CLOSE", "person or hand appears too close"
@@ -434,7 +456,7 @@ def estimate_visual_proximity(
         state, reason = "SLOW", "person or hand is inside the visual slow zone"
     else:
         state, reason = "SAFE", "visual apparent size is inside the safe zone"
-    return VisualProximity(state, reason, shoulder_size, palm_size)
+    return VisualProximity(state, reason, shoulder_size, palm_size, head_size)
 
 
 def _number(
@@ -794,7 +816,7 @@ def build_agent_motion_plan(
             raise ValueError(f"A local Agent plan may contain at most {MAX_AGENT_KEYFRAMES} keyframes.")
 
     def offsets(reference: Mapping[str, float], fractions: Mapping[str, float]) -> dict[str, float]:
-        """Small, locally defined companions stay within their intended stroke."""
+        """Add optional gestures only on axes whose measured starts are in range."""
         result = {}
         for joint, fraction in fractions.items():
             if joint not in available:
@@ -802,7 +824,10 @@ def build_agent_motion_plan(
             low, high = map(float, limits[joint])
             start = float(reference[joint])
             if not low <= start <= high:
-                raise ValueError(f"Gesture starts outside the configured range: {joint}.")
+                # An unrelated axis may rest just outside a working limit. Keep
+                # its measured position and leave it inactive; never manufacture
+                # an in-range origin or a return target for an optional flourish.
+                continue
             offset = (high - low) * fraction
             proposed = max(low, min(high, start + offset))
             reverse = max(low, min(high, start - offset))
@@ -902,9 +927,13 @@ def build_agent_motion_plan(
             if not isinstance(category, str):
                 raise ValueError("Response category must be a string.")
             original = dict(current)
-            template = _response_template(category, original, limits, tuple(available))
+            gesture_available = {
+                joint for joint in available
+                if float(limits[joint][0]) <= original[joint] <= float(limits[joint][1])
+            }
+            template = _response_template(category, original, limits, tuple(gesture_available))
             touched = tuple(
-                joint for joint in ALL_JOINTS if joint in available
+                joint for joint in ALL_JOINTS if joint in gesture_available
                 if any(joint in phase for phase in template.phases)
             )
             return_targets = _restore_updates(original, touched, limits)
@@ -912,7 +941,7 @@ def build_agent_motion_plan(
             for index, phase in enumerate(template.phases):
                 updates: dict[str, float] = {}
                 for joint, fraction in phase.items():
-                    if joint not in available:
+                    if joint not in gesture_available:
                         continue
                     low, high = limits[joint]
                     inner_low, inner_high = _inner_limits(joint, limits)

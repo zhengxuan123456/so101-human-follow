@@ -1,3 +1,4 @@
+import json
 import tempfile
 import time
 import unittest
@@ -35,6 +36,18 @@ def make_profile() -> SafeRangeProfile:
 
 
 class SafeRangeProfileTest(unittest.TestCase):
+    def create_with(self, **overrides):
+        original = make_profile()
+        arguments = {
+            "robot_id": original.robot_id,
+            "calibration_fingerprint": original.calibration_fingerprint,
+            "controlled_limits": dict(original.controlled_limits),
+            "fixed_positions": dict(original.fixed_positions),
+            "startup_positions": dict(original.startup_positions),
+        }
+        arguments.update(overrides)
+        return SafeRangeProfile.create(**arguments)
+
     def test_profile_round_trips_through_atomic_file(self):
         profile = make_profile()
         with tempfile.TemporaryDirectory() as directory:
@@ -57,8 +70,92 @@ class SafeRangeProfileTest(unittest.TestCase):
                 startup_positions=preview_initial_positions(),
             )
 
+    def test_captured_profile_defaults_to_strict_middle_margin_on_every_controlled_joint(self):
+        original = make_profile()
+        for joint, (low, high) in original.controlled_limits.items():
+            for position in (low, low + 0.25, high - 0.25, high):
+                with self.subTest(joint=joint, position=position):
+                    startup = {**original.startup_positions, joint: position}
+                    with self.assertRaisesRegex(ValueError, "comfortable middle"):
+                        self.create_with(startup_positions=startup)
+
+    def test_configured_envelope_keeps_exact_boundary_or_outside_connection_pose(self):
+        limits = dict(make_profile().controlled_limits)
+        limits["wrist_flex.pos"] = (-100.0, 100.0)
+        for position in (-100.0, 100.0, -100.12, 100.12):
+            with self.subTest(position=position):
+                startup = {**preview_initial_positions(), "wrist_flex.pos": position}
+                profile = self.create_with(
+                    controlled_limits=limits, startup_positions=startup,
+                    require_startup_middle=False,
+                )
+                self.assertEqual(profile.startup_positions, startup)
+                self.assertEqual(profile.controlled_limits, limits)
+                profile.validate(require_startup_middle=False)
+                with self.assertRaisesRegex(ValueError, "comfortable middle"):
+                    profile.validate()
+
+    def test_configured_connection_flag_does_not_relax_profile_structure_or_limits(self):
+        original = make_profile()
+        invalid_inputs = (
+            {"startup_positions": {**original.startup_positions, "wrist_flex.pos": float("nan")}},
+            {"startup_positions": {"wrist_flex.pos": 0.0}},
+            {"controlled_limits": {**original.controlled_limits, "wrist_flex.pos": (0.0, 1.0)}},
+            {"controlled_limits": {**original.controlled_limits, "wrist_flex.pos": (0.0, float("inf"))}},
+            {"fixed_positions": {**original.fixed_positions, "shoulder_pan.pos": float("nan")}},
+        )
+        for inputs in invalid_inputs:
+            with self.subTest(inputs=inputs):
+                with self.assertRaises(ValueError):
+                    self.create_with(**inputs, require_startup_middle=False)
+
+    def test_startup_middle_flag_requires_an_explicit_boolean(self):
+        for value in (None, 0, 1, "false"):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "must be a boolean"):
+                    self.create_with(require_startup_middle=value)
+
+    def test_saving_a_nonmiddle_configured_pose_still_requires_captured_profile_validation(self):
+        profile = self.create_with(
+            startup_positions={**preview_initial_positions(), "wrist_flex.pos": -12.1},
+            require_startup_middle=False,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "safety_profile.json"
+            with self.assertRaisesRegex(ValueError, "comfortable middle"):
+                save_safe_range_profile(path, profile)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_loading_cannot_disable_captured_profile_validation_with_a_serialized_flag(self):
+        profile = self.create_with(
+            startup_positions={**preview_initial_positions(), "wrist_flex.pos": 12.1},
+            require_startup_middle=False,
+        )
+        raw = {**profile.to_dict(), "require_startup_middle": False}
+        with self.assertRaisesRegex(ValueError, "comfortable middle"):
+            SafeRangeProfile.from_dict(raw)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "safety_profile.json"
+            path.write_text(json.dumps(raw), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "comfortable middle"):
+                load_safe_range_profile(path)
+
 
 class DynamicLimitTest(unittest.TestCase):
+    def test_startup_safety_guards_remain_independent_of_profile_midpoint_validation(self):
+        config = load_config("config.example.json")
+        invalid_starts = (
+            {"wrist_flex.pos": config.safety.startup_body_abs_limit + 0.1},
+            {"wrist_flex.pos": -config.safety.startup_body_abs_limit - 0.1},
+            {"gripper.pos": config.safety.absolute_limits["gripper.pos"][0] - 0.1},
+            {"gripper.pos": config.safety.absolute_limits["gripper.pos"][1] + 0.1},
+        )
+        for updates in invalid_starts:
+            with self.subTest(updates=updates):
+                positions = {**preview_initial_positions(), **updates}
+                with self.assertRaisesRegex(ValueError, "outside its configured startup range"):
+                    MotionController(positions, config.mapping, config.safety)
+
     def test_motion_controller_never_exceeds_user_safe_range(self):
         config = load_config("config.example.json")
         limits = {

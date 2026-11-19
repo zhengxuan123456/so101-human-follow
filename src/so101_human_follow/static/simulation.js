@@ -5,6 +5,7 @@
   if (!dialog) return;
   const elements = {
     message: byId("simulationMessage"), image: byId("simulationFrame"), hint: byId("simulationFrameHint"),
+    view: byId("simulationViewSelect"), azimuth: byId("simulationAzimuth"), distance: byId("simulationDistance"),
     joints: byId("simulationJointControls"), progress: byId("simulationProgress"), contacts: byId("simulationContacts"),
     frames: byId("simulationKeyframes"), capture: byId("simulationCaptureButton"),
     move: byId("simulationMoveTime"), hold: byId("simulationHoldTime"), name: byId("simulationActionName"),
@@ -82,13 +83,41 @@
   }
 
   async function api(path, payload = null, signal = controller?.signal) {
-    const response = await fetch(path, {
-      method: payload === null ? "GET" : "POST", credentials: "same-origin", cache: "no-store",
-      headers: headers(), signal, ...(payload === null ? {} : { body: JSON.stringify(payload) }),
-    });
-    const value = await response.json().catch(() => ({}));
-    if (!response.ok) throw Object.assign(new Error(value.error || value.message || `请求失败：${response.status}`), { status: response.status });
-    return value;
+    // Bound read-only refreshes without pretending an aborted POST cancels a
+    // hardware command. Keep dialog cancellation connected to every request.
+    const readController = payload === null ? new AbortController() : null;
+    const requestSignal = readController?.signal ?? signal;
+    const parentAbort = () => readController.abort(signal.reason);
+    let deadline = null;
+    let timedOut = false;
+    if (readController) {
+      if (signal?.aborted) parentAbort();
+      else signal?.addEventListener("abort", parentAbort, { once: true });
+      deadline = window.setTimeout(() => {
+        timedOut = true;
+        readController.abort();
+      }, 5000);
+    }
+    try {
+      const response = await fetch(path, {
+        method: payload === null ? "GET" : "POST", credentials: "same-origin", cache: "no-store",
+        headers: headers(), signal: requestSignal, ...(payload === null ? {} : { body: JSON.stringify(payload) }),
+      });
+      const value = await response.json().catch(error => {
+        if (requestSignal?.aborted) throw error;
+        return {};
+      });
+      if (!response.ok) throw Object.assign(new Error(value.error || value.message || `请求失败：${response.status}`), { status: response.status });
+      return value;
+    } catch (error) {
+      if (timedOut && !signal?.aborted) {
+        throw Object.assign(new Error("读取状态超时，正在等待连接恢复。"), { code: "READ_TIMEOUT" });
+      }
+      throw error;
+    } finally {
+      if (deadline !== null) window.clearTimeout(deadline);
+      if (readController) signal?.removeEventListener("abort", parentAbort);
+    }
   }
 
   function message(text, error = false) {
@@ -363,13 +392,15 @@
   }
 
   async function refreshFrame(signal) {
-    const response = await fetch("/api/simulation/frame", { headers: headers(), credentials: "same-origin", cache: "no-store", signal });
+    const view = elements.view.value;
+    const path = view === "wrist" ? "/api/simulation/frame?view=wrist" : "/api/simulation/frame";
+    const response = await fetch(path, { headers: headers(), credentials: "same-origin", cache: "no-store", signal });
     if (!response.ok) {
       const value = await response.json().catch(() => ({}));
       throw new Error(value.error || "仿真画面读取失败。");
     }
     const blob = await response.blob();
-    if (signal.aborted || !dialog.open) return;
+    if (signal.aborted || !dialog.open || view !== elements.view.value) return;
     const previous = objectUrl;
     objectUrl = URL.createObjectURL(blob);
     elements.image.src = objectUrl; elements.image.classList.add("has-frame"); elements.hint.hidden = true;
@@ -414,10 +445,11 @@
       void refreshLibrary().catch(error => {
         if (error.name !== "AbortError" && currentGeneration === generation) message(error.message, true);
       });
-      void tick(currentGeneration);
     } catch (error) {
       if (error.name !== "AbortError") { message(error.message, true); elements.hint.textContent = error.message; }
+      return;
     }
+    void tick(currentGeneration);
   }
 
   function actionPayload(includeRecording = false) {
@@ -1077,9 +1109,15 @@
   function cameraChanged() {
     window.clearTimeout(cameraTimer);
     cameraTimer = window.setTimeout(() => {
-      void api("/api/simulation/camera", { azimuth: Number(byId("simulationAzimuth").value), elevation: -22, distance: Number(byId("simulationDistance").value) }).catch(error => message(error.message, true));
+      void api("/api/simulation/camera", { azimuth: elements.azimuth.valueAsNumber, elevation: -22, distance: elements.distance.valueAsNumber }).catch(error => message(error.message, true));
     }, 100);
   }
-  byId("simulationAzimuth").addEventListener("input", cameraChanged);
-  byId("simulationDistance").addEventListener("input", cameraChanged);
+  elements.azimuth.addEventListener("input", cameraChanged);
+  elements.distance.addEventListener("input", cameraChanged);
+  elements.view.addEventListener("change", () => {
+    const wrist = elements.view.value === "wrist";
+    elements.azimuth.disabled = wrist;
+    elements.distance.disabled = wrist;
+    elements.image.alt = wrist ? "SO-101 MuJoCo 腕部相机示意画面" : "SO-101 MuJoCo 实时物理仿真画面";
+  });
 })();

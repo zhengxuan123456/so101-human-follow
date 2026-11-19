@@ -45,7 +45,7 @@
           <div>
             <strong>网页停止不是物理急停。</strong>
             运行时请让机械臂实体电源开关保持触手可及；断开会释放扭矩，机械臂可能下坠。
-            Agent 只能调用允许的动作；关节限位、模型或连接异常时会拒绝运动。视觉检查仅用于视频跟随。
+            Agent 只能调用允许的动作；关节限位、模型或连接异常时会拒绝运动。视频跟随和陪伴模式使用相机。
           </div>
         </section>
 
@@ -54,27 +54,40 @@
         </div>
 
         <section class="mode-entry-grid" aria-label="选择控制方式">
-          <button id="openVideoFollowButton" class="mode-entry-card video-entry-card" type="button">
+          <button id="openVideoFollowButton" class="mode-entry-card video-entry-card" type="button"
+            aria-haspopup="dialog" aria-controls="videoFollowDialog">
             <span class="mode-entry-icon" aria-hidden="true">◉</span>
             <span class="mode-entry-copy">
-              <small>CAMERA · POSE + HAND</small>
               <strong>视频跟随</strong>
-              <span>连接相机后，完成“中立姿势 → ARM”</span>
+              <span>识别人体姿态与手势，控制机械臂</span>
             </span>
             <span class="mode-entry-arrow" aria-hidden="true">→</span>
           </button>
-          <button id="openAgentChatButton" class="mode-entry-card agent-entry-card" type="button">
+          <button id="openAgentChatButton" class="mode-entry-card agent-entry-card" type="button"
+            aria-haspopup="dialog" aria-controls="agentChatDialog">
             <span class="mode-entry-icon" aria-hidden="true">♡</span>
             <span class="mode-entry-copy">
-              <small>VOICE · FUNCTION CALLING</small>
-              <strong><span class="agent-entry-name">小助手</span>对话</strong>
-              <span>文字或持续语音交流，让 Agent 编排安全动作</span>
+              <strong>对话</strong>
+              <span>与<span class="agent-entry-name">小助手</span>文字或语音交流</span>
             </span>
             <span class="mode-entry-arrow" aria-hidden="true">→</span>
           </button>
-          <button id="openSimulationButton" class="mode-entry-card simulation-entry-card" type="button">
+          <button id="openSimulationButton" class="mode-entry-card simulation-entry-card" type="button"
+            aria-haspopup="dialog" aria-controls="simulationDialog">
             <span class="mode-entry-icon" aria-hidden="true">◇</span>
-            <span class="mode-entry-copy"><small>MUJOCO · ACTION STUDIO</small><strong>六轴仿真与动作编辑</strong><span>主从臂示教录制、仿真回放与动作编排</span></span>
+            <span class="mode-entry-copy">
+              <strong>仿真与动作编辑</strong>
+              <span>示教录制、动作编排与仿真回放</span>
+            </span>
+            <span class="mode-entry-arrow" aria-hidden="true">→</span>
+          </button>
+          <button id="openCompanionButton" class="mode-entry-card companion-entry-card" type="button"
+            aria-haspopup="dialog" aria-controls="companionDialog">
+            <span class="mode-entry-icon" aria-hidden="true">✦</span>
+            <span class="mode-entry-copy">
+              <strong>陪伴模式</strong>
+              <span>腕部相机看向你，响应手势与互动</span>
+            </span>
             <span class="mode-entry-arrow" aria-hidden="true">→</span>
           </button>
         </section>
@@ -82,18 +95,25 @@
         <div class="dashboard-grid agent-dashboard-grid home-control-layout">
           <dialog id="videoFollowDialog" class="mode-dialog" aria-labelledby="videoFollowDialogTitle">
             <div class="mode-dialog-shell">
-              <header class="mode-dialog-header">
+              <header class="mode-dialog-header video-follow-header">
                 <div>
                   <p class="section-kicker">VIDEO FOLLOW</p>
                   <h2 id="videoFollowDialogTitle">视频跟随</h2>
                 </div>
+                <div id="videoStopSlot">
+                  <button id="videoDialogStopButton" class="stop-button" type="button" disabled>
+                    <span class="stop-symbol" aria-hidden="true"></span>
+                    <strong>立即停止机械臂动作</strong>
+                  </button>
+                </div>
                 <button id="closeVideoFollowButton" class="dialog-close" type="button" aria-label="关闭视频跟随">×</button>
               </header>
-              <section class="panel camera-panel">
+              <div id="videoCameraSlot" class="camera-panel-slot">
+              <section id="cameraPanel" class="panel camera-panel">
             <div class="panel-heading">
               <div>
                 <p class="section-kicker">CAMERA · POSE + HAND</p>
-                <h2>实时人体与手部姿态</h2>
+                <h2 id="cameraPanelTitle">实时人体与手部姿态</h2>
               </div>
               <span id="previewBadge" class="badge badge-muted">未连接</span>
             </div>
@@ -102,12 +122,12 @@
               <label class="camera-name-field" for="cameraName">
                 相机名称
                 <input id="cameraName" name="cameraName" type="text" list="cameraDevices"
-                  placeholder="例如 Integrated Camera" autocomplete="off" maxlength="256" disabled>
+                  value="icspring camera" autocomplete="off" maxlength="256" disabled>
                 <datalist id="cameraDevices"></datalist>
               </label>
               <button id="cameraConnectButton" class="button button-secondary" type="submit" disabled>连接视频</button>
               <button id="cameraDisconnectButton" class="button button-danger-outline" type="button" disabled>断开视频</button>
-              <p id="cameraStatus" class="camera-status" role="status">填写设备管理器中的相机名称，留空使用默认相机。</p>
+              <p id="cameraStatus" class="camera-status" role="status">使用设备管理器中的相机名称。陪伴模式使用腕部相机。</p>
             </form>
 
             <div class="video-stage">
@@ -140,39 +160,112 @@
               </article>
             </div>
               </section>
-              <section class="panel video-follow-control-panel" aria-labelledby="videoFollowControlTitle">
-                <div class="panel-heading">
-                  <div>
-                    <p class="section-kicker">HUMAN FOLLOW ONLY</p>
-                    <h2 id="videoFollowControlTitle">人体视觉跟随流程</h2>
+              </div>
+              <div class="video-follow-sidebar">
+                <section class="panel video-follow-control-panel" aria-labelledby="videoFollowControlTitle">
+                  <div class="panel-heading">
+                    <div>
+                      <p class="section-kicker">HUMAN FOLLOW ONLY</p>
+                      <h2 id="videoFollowControlTitle">人体视觉跟随流程</h2>
+                    </div>
+                    <span class="mode-pill vision-mode-pill">需中立姿势</span>
                   </div>
-                  <span class="mode-pill vision-mode-pill">需中立姿势</span>
-                </div>
-                <p class="video-follow-hint">连接相机和从臂后，从“采集中立姿势”开始。</p>
-                <ol id="videoFollowSteps" class="control-sequence video-follow-steps"></ol>
-                <div id="videoStopSlot">
-                  <button id="videoDialogStopButton" class="stop-button" type="button" disabled>
-                    <span class="stop-symbol" aria-hidden="true"></span>
-                    <span>
-                      <strong>立即停止机械臂动作</strong>
-                      <small>与首页急停按钮同步 · 停止人体跟随或 Agent 动作</small>
-                    </span>
-                  </button>
-                </div>
-              </section>
+                  <p class="video-follow-hint">连接相机和从臂后，从“采集中立姿势”开始。</p>
+                  <ol id="videoFollowSteps" class="control-sequence video-follow-steps"></ol>
+                </section>
+              </div>
             </div>
           </dialog>
 
-          <dialog id="agentChatDialog" class="mode-dialog agent-mode-dialog" aria-labelledby="agentPanelTitle">
+          <dialog id="companionDialog" class="mode-dialog companion-mode-dialog" aria-labelledby="companionDialogTitle">
+            <div class="mode-dialog-shell">
+              <header class="mode-dialog-header">
+                <h2 id="companionDialogTitle">陪伴模式</h2>
+                <button id="closeCompanionButton" class="dialog-close" type="button" aria-label="关闭陪伴模式窗口">×</button>
+              </header>
+              <p class="companion-entry-description">腕部相机看向你，响应手势与互动。进入后可以连接机械臂和相机。</p>
+              <button id="companionEnterButton" class="button button-agent" type="button"
+                aria-haspopup="dialog" aria-controls="companionWorkspaceDialog">开启陪伴</button>
+            </div>
+          </dialog>
+
+          <dialog id="companionWorkspaceDialog" class="mode-dialog companion-workspace-dialog" aria-labelledby="companionWorkspaceTitle">
+            <div class="mode-dialog-shell">
+              <header class="mode-dialog-header video-follow-header">
+                <h2 id="companionWorkspaceTitle">陪伴模式</h2>
+                <span id="companionBadge" class="badge badge-muted">已关闭</span>
+                <button id="companionDialogStopButton" class="stop-button" type="button" disabled>
+                  <span class="stop-symbol" aria-hidden="true"></span>
+                  <strong>立即停止机械臂动作</strong>
+                </button>
+                <button id="closeCompanionWorkspaceButton" class="dialog-close" type="button" aria-label="关闭陪伴操作界面">×</button>
+              </header>
+              <div id="companionCameraSlot" class="camera-panel-slot"></div>
+              <div class="companion-sidebar">
+              <section id="companionControls" class="companion-controls" aria-label="陪伴模式控制">
+                <form id="companionRobotForm" class="companion-robot-connection">
+                  <label for="companionFollowerPort">从臂串口
+                    <input id="companionFollowerPort" type="text" value="COM4" placeholder="例如 COM4"
+                      autocomplete="off" maxlength="128" disabled>
+                  </label>
+                  <button id="companionConnectButton" class="button button-secondary" type="submit" disabled>连接机械臂</button>
+                  <button id="companionDisconnectButton" class="button button-danger-outline" type="button" disabled>断开机械臂</button>
+                </form>
+                <p id="companionRobotStatus" role="status">正在读取从臂连接状态…</p>
+                <p id="companionDescription">腕部相机追踪面部，识别张手或握拳时控制夹爪。</p>
+                <section class="companion-gaze-calibration" aria-labelledby="gazeCalibrationTitle">
+                  <div class="companion-heading">
+                    <h3 id="gazeCalibrationTitle">注视方向标定</h3>
+                    <span id="gazeCalibrationBadge" class="badge badge-muted">未标定</span>
+                  </div>
+                  <p id="gazeCalibrationHint">从当前姿态开始，点击后 3 秒自动找脸并标定。</p>
+                  <div class="companion-actions">
+                    <button id="gazeCalibrationStartButton" class="button button-secondary" type="button"
+                      aria-describedby="gazeCalibrationHint gazeCalibrationStatus" disabled>开始注视标定</button>
+                    <button id="gazeCalibrationCancelButton" class="button button-danger-outline" type="button" disabled hidden>取消标定</button>
+                  </div>
+                  <progress id="gazeCalibrationProgress" class="progress-track" max="100" value="0"
+                    aria-label="注视方向标定进度" hidden></progress>
+                  <p id="gazeCalibrationStatus" role="status" aria-live="polite">准备好后点击开始。</p>
+                  <details>
+                    <summary>标定说明</summary>
+                    <p>点击后可以走回镜头前。标定时保持自然姿态，尽量不动；底座和腕部会小幅转动，结果保存在本机。可随时取消，关闭此窗口也会结束标定。</p>
+                  </details>
+                  <details id="gazeCalibrationLastErrorDetails" hidden>
+                    <summary id="gazeCalibrationLastErrorSummary">查看上次标定未完成的原因</summary>
+                    <p id="gazeCalibrationLastError"></p>
+                  </details>
+                  <p id="gazeCenterError" hidden></p>
+                </section>
+                <div class="companion-settings">
+                  <label class="companion-check" for="companionUnoccupied">
+                    <input id="companionUnoccupied" type="checkbox" aria-describedby="companionSearchHint" disabled>
+                    <span>运动范围已物理隔离，允许底座和腕部左右、上下搜索头部</span>
+                  </label>
+                </div>
+                <p id="companionSearchHint">头部未入镜时，在原限位内小幅搜索；定位后停止搜索并保持头部居中。请在开启陪伴前勾选。</p>
+                <div class="companion-actions">
+                  <button id="companionToggleButton" class="button button-secondary" type="button"
+                    aria-describedby="companionDescription companionStatus" disabled>开始陪伴</button>
+                </div>
+                <p id="companionStatus" role="status">连接机械臂和腕部相机，完成注视方向标定后开始陪伴。</p>
+              </section>
+                <div id="companionAgentSlot"></div>
+              </div>
+            </div>
+          </dialog>
+
+          <dialog id="agentChatDialog" class="mode-dialog agent-mode-dialog" aria-labelledby="agentDialogTitle">
             <div class="mode-dialog-shell">
               <header class="mode-dialog-header">
                 <div>
                   <p class="section-kicker">VOICE AGENT</p>
-                  <h2>小助手对话</h2>
+                  <h2 id="agentDialogTitle">小助手对话</h2>
                 </div>
                 <button id="closeAgentChatButton" class="dialog-close" type="button" aria-label="关闭小助手对话">×</button>
               </header>
-              <section class="panel agent-panel" aria-labelledby="agentPanelTitle">
+              <div id="homeAgentSlot">
+                <section id="agentPanel" class="panel agent-panel" aria-labelledby="agentPanelTitle">
             <div class="panel-heading agent-heading">
               <div class="agent-identity">
                 <div id="agentAvatar" class="agent-avatar" aria-hidden="true">♡</div>
@@ -181,8 +274,20 @@
                   <h2 id="agentPanelTitle"><span id="agentDisplayName">小助手</span> 的对话</h2>
                 </div>
               </div>
-              <span id="agentStatusBadge" class="badge badge-muted">本地指令可用</span>
+              <div class="agent-dialog-actions">
+                <span id="agentStatusBadge" class="badge badge-muted">本地指令可用</span>
+                <button id="agentChatSettingsButton" class="button button-secondary" type="button">Agent 设置</button>
+              </div>
             </div>
+
+            <div class="voice-controls">
+              <button id="voiceToggleButton" class="voice-toggle-button" type="button" aria-pressed="false">
+                <span class="voice-icon" aria-hidden="true">🎙</span>
+                <span><strong>开始语音 Agent</strong><small>可说“点头两次”“打开夹爪”或“停止”</small></span>
+              </button>
+              <button id="cancelAgentButton" class="button button-danger-outline" type="button" disabled>取消当前交互</button>
+            </div>
+            <p id="voiceStateText" class="voice-state-text" role="status">语音 Agent 未开启</p>
 
             <div id="agentSetupNotice" class="agent-setup-notice">
               <strong>云端对话尚未配置</strong>
@@ -231,17 +336,10 @@
               </label>
             </div>
 
-            <div class="voice-controls">
-              <button id="voiceToggleButton" class="voice-toggle-button" type="button" aria-pressed="false">
-                <span class="voice-icon" aria-hidden="true">🎙</span>
-                <span><strong>开始语音 Agent</strong><small>开启后持续监听，直到手动关闭</small></span>
-              </button>
-              <button id="cancelAgentButton" class="button button-danger-outline" type="button" disabled>取消当前交互</button>
-            </div>
-            <p id="voiceStateText" class="voice-state-text">语音 Agent 未开启</p>
             <p id="speechPlaybackMessage" class="voice-state-text" role="status" aria-live="polite"></p>
             <button id="replaySpeechButton" class="button button-secondary" type="button" hidden>点击播放语音</button>
-              </section>
+                </section>
+              </div>
             </div>
           </dialog>
 
@@ -364,7 +462,7 @@
               <span class="stop-symbol" aria-hidden="true"></span>
               <span>
                 <strong>立即停止机械臂动作</strong>
-                <small>停止人体跟随或 Agent 动作 · 不主动释放扭矩</small>
+                <small>停止人体跟随、Agent 动作和陪伴模式 · 保持扭矩</small>
               </span>
             </button>
 
@@ -643,7 +741,7 @@
               <p id="simulationFollowerRecordingNote" class="simulation-note" hidden></p>
               <p id="simulationRecordingDescription" class="simulation-note" hidden></p>
             </div>
-            <div class="simulation-camera"><label>观察方向 <input id="simulationAzimuth" type="range" min="-180" max="180" value="140"></label><label>观察距离 <input id="simulationDistance" type="range" min="0.35" max="1.5" step="0.05" value="0.85"></label><span id="simulationContacts">接触点：0</span></div>
+            <div class="simulation-camera"><label>观察视角 <select id="simulationViewSelect"><option value="external">外部视角</option><option value="wrist">腕部视角（示意）</option></select></label><label>观察方向 <input id="simulationAzimuth" type="range" min="-180" max="180" value="140"></label><label>观察距离 <input id="simulationDistance" type="range" min="0.35" max="1.5" step="0.05" value="0.85"></label><span id="simulationContacts">接触点：0</span></div>
             <p class="simulation-note">编辑值为 LeRobot 归一化位置；模型角度为弧度换算。零点、方向和真机映射仍需核对，仿真结果不等于真机避障验证。</p>
           </section>
           <section class="simulation-editor-panel">

@@ -31,7 +31,10 @@ from .agent_actions import (
     step_toward_agent_target,
 )
 from .camera_device import camera_index_by_name
+from .companion import CompanionMotion, CompanionRangeError, companion_hand_openness, head_target
 from .config import ALL_JOINTS, CONTROLLED_JOINTS, FIXED_JOINTS, AppConfig
+from .gaze_controller import GazeCalibration, GazeCalibrator, ImageGazeController
+from .gaze_storage import atomic_write_gaze, gaze_state_path, read_gaze
 from .motion_profile import cosine_progress
 from .pose_detector import (
     MediaPipePoseDetector,
@@ -40,7 +43,7 @@ from .pose_detector import (
     orient_camera_frame,
 )
 from .pose_math import PoseFeatures
-from .robot_adapter import SO101CalibrationSession, SO101RobotAdapter, preview_initial_positions
+from .robot_adapter import CalibrationRangeError, SO101CalibrationSession, SO101RobotAdapter, preview_initial_positions
 from .safe_range import (
     SafeRangeProfile,
     load_safe_range_profile,
@@ -70,6 +73,11 @@ TRAJECTORY_TRACKING_TIMEOUT_S = 0.35
 TEACH_MIN_CONTROL_HZ = 25.0
 TEACH_TARGET_SMOOTHING_S = 0.04
 TEACH_TARGET_MAX_AGE_S = 0.15
+COMPANION_CONTROL_PERIOD_S = 0.05
+COMPANION_FRAME_MAX_AGE_S = 0.75
+COMPANION_PRESENCE_CONFIRM_S = 0.45
+COMPANION_TARGET_GAP_S = 0.20
+AGENT_INTERACTION_PREEMPT_REASON = "new utterance interrupted the previous interaction"
 
 
 def _agent_feedback_tolerance(joint: str) -> float:
@@ -122,6 +130,7 @@ class ControlEngine:
         robot_allowed: bool,
         lease_timeout_s: float = 2.0,
         profile_path: str | Path | None = None,
+        gaze_path: str | Path | None = None,
     ):
         self.config = config
         self.robot_allowed = robot_allowed
@@ -134,6 +143,7 @@ class ControlEngine:
         self._commands: queue.Queue[ControlCommand] = queue.Queue(maxsize=8)
         self._shutdown = threading.Event()
         self._motion_stop = threading.Event()
+        self._stop_sequence = 0
         self._motion_stop.set()
         self._thread: threading.Thread | None = None
         self._vision_thread: threading.Thread | None = None
@@ -155,6 +165,42 @@ class ControlEngine:
 
         self._robot: SO101RobotAdapter | None = None
         self._connection_positions: dict[str, float] | None = None
+        self._companion_mechanical_limits: dict[str, tuple[float, float]] | None = None
+        self._companion_client: str | None = None
+        self._companion_motion: CompanionMotion | None = None
+        self._companion_last_tick: float | None = None
+        self._companion_last_probe_at: float | None = None
+        self._companion_presence: tuple[str, float] | None = None
+        self._companion_last_eligible_at: float | None = None
+        self._companion_state = "off"
+        self._companion_reason = "陪伴模式已关闭。"
+        self._companion_allow_search = False
+        self._companion_allow_vertical_search = False
+        self._companion_interaction_until = 0.0
+        self._companion_frame_at: float | None = None
+        self._companion_search_at: float | None = None
+        self._companion_track_id: str | None = None
+        self._gaze_path = (Path(gaze_path) if gaze_path is not None else
+                           None if self.profile_path is None else gaze_state_path(self.profile_path.parent))
+        self._gaze_calibration: GazeCalibration | None = None
+        self._gaze_controller: ImageGazeController | None = None
+        self._gaze_calibrator: GazeCalibrator | None = None
+        self._gaze_client: str | None = None
+        self._gaze_epoch: int | None = None
+        self._gaze_tick_at: float | None = None
+        self._gaze_preparing = False
+        self._gaze_requested_at: float | None = None
+        self._gaze_stop_sequence: int | None = None
+        self._gaze_prepare_sample: dict[str, Any] | None = None
+        self._gaze_phase = "idle"
+        self._gaze_preparation_detail = ""
+        self._gaze_has_written = False
+        self._gaze_raw_observation: dict[str, Any] | None = None
+        self._gaze_state = "uncalibrated"
+        self._gaze_reason = "请先进行注视方向标定，再开启陪伴。"
+        self._gaze_progress = 0.0
+        self._gaze_error: tuple[float, float] | None = None
+        self._gaze_fault_code: str | None = None
         self._teach = TeachRecorder(config.robot)
         self._teach_client: str | None = None
         self._teach_stop_reason: str | None = None
@@ -211,6 +257,7 @@ class ControlEngine:
         self._agent_recovery_positions: dict[str, float] | None = None
         self._agent_recovery_joints: tuple[str, ...] = ()
         self._agent_hold_pending = False
+        self._agent_raw_hold_pending = False
         self._agent_return_verified = False
         self._agent_motion_state = "IDLE"
         self._agent_motion_message = "No Agent motion is active"
@@ -264,6 +311,14 @@ class ControlEngine:
         self._latest_jpeg: bytes | None = None
         self._frame_revision = 0
         self._last_frame_time: float | None = None
+        if self._gaze_path is not None and self._gaze_path.is_file():
+            try:
+                self._gaze_calibration = GazeCalibration.from_dict(read_gaze(self._gaze_path))
+                self._gaze_controller = ImageGazeController(self._gaze_calibration)
+                self._gaze_state, self._gaze_reason = "ready", "已载入注视标定，连接设备后检查是否匹配。"
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                LOGGER.warning("gaze calibration ignored | %s", exc)
+                self._gaze_reason = "注视标定文件无效，请重新标定。"
         LOGGER.info(
             "engine initialized | robot_id=%s port=%s robot_allowed=%s log=%s",
             self.config.robot.id,
@@ -322,7 +377,8 @@ class ControlEngine:
                     # was already DISARMED.
                     self._motion_stop.set()
                     self._epoch += 1
-                if expired and (self._armed or self._agent_plan is not None):
+                if expired and (self._armed or self._agent_plan is not None or self._companion_client is not None
+                                or self._gaze_client is not None):
                     disarm_reason = "operator lease expired"
                 # Native browser confirmation prompts pause JavaScript timers, so the
                 # status heartbeat can legitimately expire while the operator is
@@ -352,6 +408,7 @@ class ControlEngine:
             )
 
     def disarm(self, reason: str = "operator request") -> None:
+        self._stop_sequence += 1
         self._motion_stop.set()
         # If a serial write is already in flight, it cannot be interrupted. Holding this
         # gate guarantees that no stale write can start after disarm() returns.
@@ -361,6 +418,12 @@ class ControlEngine:
                 was_agent_active = self._agent_plan is not None
                 self._armed = False
                 self._epoch += 1
+                self._motion_stop.set()
+                self._cancel_gaze_locked(f"注视标定已停止：{reason}")
+                if reason == AGENT_INTERACTION_PREEMPT_REASON:
+                    self._stop_companion_motion_locked()
+                else:
+                    self._disable_companion_locked()
                 if was_agent_active:
                     self._cancel_agent_plan_locked(reason)
                 if self._teach.sync_active and self._teach_stop_reason is None:
@@ -686,21 +749,24 @@ class ControlEngine:
                 "operator": operator,
                 "lease_age_s": lease_age,
                 "lease_timeout_s": self.lease_timeout_s,
+                "motion_epoch": self._epoch,
                 "can_arm": can_arm,
                 "can_start_agent_motion": can_start_agent_motion,
+                "companion": self._companion_status_locked(),
                 "visual_proximity": {
                     "state": self._visual_proximity.state,
                     "reason": self._visual_proximity.reason,
                     "shoulder_size": self._visual_proximity.shoulder_size,
                     "palm_size": self._visual_proximity.palm_size,
+                    "head_size": self._visual_proximity.head_size,
                     "age_s": proximity_age,
                     "metric_distance_available": False,
                 },
                 "agent_motion": {
                     "state": self._agent_motion_state,
-                    "motion_id": self._agent_plan_epoch,
+                    "motion_id": self._agent_plan_epoch if agent_active else None,
                     "active": agent_active,
-                    "name": None if self._agent_plan is None else self._agent_plan.name,
+                    "name": self._agent_plan.name if agent_active else None,
                     "step_index": self._agent_plan_index,
                     "step_count": (
                         0 if self._agent_plan is None else len(self._agent_plan.keyframes)
@@ -873,6 +939,814 @@ class ControlEngine:
             "preview_error": self._preview_error,
         }
 
+    def _gaze_metadata_locked(self) -> dict[str, Any]:
+        """Bind measurements to this physical arm and the oriented camera image."""
+        camera = self.config.camera
+        return {
+            "camera_name": (self._camera_name or camera.wrist_name).strip().casefold(),
+            "rotation_degrees": camera.rotation_degrees,
+            "flip_horizontal": camera.flip_horizontal, "flip_vertical": camera.flip_vertical,
+            "width": camera.width, "height": camera.height,
+            "robot_id": self.config.robot.id, "robot_port": self.config.robot.port,
+            "calibration_fingerprint": self._calibration_fingerprint or "",
+            "limits": ({joint: list(values) for joint, values in self.companion_joint_limits().items()}
+                       if self._companion_mechanical_limits is not None else None),
+        }
+
+    def _gaze_ready_locked(self) -> bool:
+        return bool(
+            self._gaze_calibration is not None and self._gaze_controller is not None
+            and self._companion_mechanical_limits is not None
+            and self._robot is not None and self._robot.connected
+            and self._gaze_calibration.metadata == self._gaze_metadata_locked()
+            and self._gaze_state not in {"fault", "pose_changed"}
+            and self._gaze_client is None
+        )
+
+    def _gaze_target_locked(self, now: float, client_id: str) -> tuple[float, float] | None:
+        if (not self._companion_camera_ready_locked(now, client_id)
+                or self._companion_frame_at is None or now - self._companion_frame_at > 0.25
+                or self._visual_proximity.state != "SAFE"
+                or self._detection.people_count > 1
+                or self._detection.reason in {"person changed", "multiple people"}
+                or getattr(self._detection, "head_source", None) != "face"
+                or not getattr(self._detection, "head_verified", False)
+                or not getattr(self._detection, "head_track_id", None)):
+            return None
+        center = head_target(self._detection)
+        if center is None or not all(0.10 <= value <= 0.90 for value in center):
+            return None
+        return center
+
+    def _gaze_calibration_block_reason_locked(self, now: float, *, ignore_active: bool = False) -> str:
+        if self._gaze_client is not None and not ignore_active:
+            return "正在标定，可点击取消或立即停止。"
+        if self._companion_client is not None:
+            return "请先暂停陪伴，再标定注视方向。"
+        if not self.robot_allowed or self._robot is None or not self._robot.connected:
+            return "请先连接机械臂。"
+        if not self._companion_robot_available_locked() or self._agent_hold_pending:
+            return "请先结束其他真机动作或校准，等待机械臂保持当前位置。"
+        if self._companion_mechanical_limits is None:
+            return "正在等待舵机运动范围，请重新连接机械臂。"
+        if not self._companion_camera_ready_locked(now, self._camera_owner):
+            return "请先连接腕部相机。"
+        measured = self._range_current or self._connection_positions
+        if measured is not None:
+            try:
+                limits = self.companion_joint_limits()
+                for joint, label in (("shoulder_pan.pos", "底座 ID1"), ("wrist_flex.pos", "腕部 ID4")):
+                    position = float(measured[joint])
+                    low, high = limits[joint]
+                    if not math.isfinite(position) or not low <= position <= high:
+                        return f"{label} 实测位置 {position:.2f} 超出动作范围 [{low:.2f}, {high:.2f}]，请先托住并断开后调整姿态，再连接标定。"
+                    if max(high - position, position - low) - 0.1 < 0.5:
+                        return f"{label} 缺少向内小步探测空间。"
+            except (TypeError, ValueError, KeyError, OverflowError):
+                return "关节位置反馈无效，请检查连接后重试。"
+        if self._visual_proximity.state == "TOO_CLOSE":
+            return "人脸或手部在画面中看起来过近，请稍微远离镜头后标定。"
+        if self._visual_proximity.state == "SLOW":
+            return "人脸或手部占画面较大，请稍微远离镜头，等待距离提示恢复正常后标定。"
+        if self._gaze_target_locked(now, self._camera_owner) is None:
+            return "请让同一张脸稳定出现在画面内并留出边缘空间；等待人脸复核通过，避免贴近镜头。"
+        return ""
+
+    def _gaze_status_locked(self) -> dict[str, Any]:
+        ready = self._gaze_ready_locked()
+        state, reason = self._gaze_state, self._gaze_reason
+        if (self._gaze_calibration is not None and self._gaze_client is None
+                and self._gaze_phase not in {"calibration_range_mismatch", "calibration_read_failed"}
+                and self._gaze_calibration.metadata != self._gaze_metadata_locked()):
+            state, reason = "camera_changed", "相机方向、设备或舵机校准已变化，请重新标定注视方向。"
+        blocked = self._gaze_calibration_block_reason_locked(time.monotonic())
+        return {
+            "state": state, "reason": reason, "calibrated": ready,
+            "calibrating": self._gaze_client is not None, "progress": self._gaze_progress,
+            "preparing": self._gaze_preparing, "phase": self._gaze_phase,
+            "countdown_remaining": (max(0, math.ceil(3.0 - (time.monotonic() - self._gaze_requested_at)))
+                                    if self._gaze_preparing and self._gaze_requested_at is not None else 0),
+            "preparation_detail": self._gaze_preparation_detail,
+            "error": self._gaze_error, "can_calibrate": not blocked,
+            "calibration_block_reason": blocked,
+            "diagnostics": {"target_id": getattr(self._detection, "head_track_id", None),
+                            "head_state": getattr(self._detection, "head_state", ""),
+                            "fault_code": self._gaze_fault_code,
+                            "raw_positions": (self._gaze_raw_observation or {}).get("raw_positions", {}),
+                            "raw_limits": (self._gaze_raw_observation or {}).get("raw_limits", {}),
+                            "clipped_joints": (self._gaze_raw_observation or {}).get("clipped_joints", []),
+                            "saved": self._gaze_path is not None and self._gaze_path.is_file()},
+        }
+
+    def request_gaze_calibration(
+        self, *, client_id: str, action: str, expected_epoch: int | None,
+        confirmation: str = "",
+    ) -> dict[str, Any]:
+        """Schedule powered probing; only the existing serial loop performs I/O."""
+        with self._send_lock, self._lock:
+            now = time.monotonic()
+            if not self._lease_valid_locked(client_id, now):
+                raise ControlError("请先取得网页控制权。")
+            if action == "cancel":
+                if self._gaze_client is None:
+                    self._epoch += 1
+                self._cancel_gaze_locked("已取消注视标定，保持当前位置。")
+                return {"ok": True, "gaze": self._gaze_status_locked()}
+            if action != "start":
+                raise ControlError("不支持的注视标定操作。")
+            if expected_epoch != self._epoch:
+                raise ControlError("控制状态已更新，请刷新后重新点击标定。")
+            if confirmation != CONTROL_CONFIRMATION_CODE:
+                raise ControlError("请通过注视方向标定按钮启动。")
+            if self._gaze_client is not None:
+                raise ControlError("标定流程已经启动，请继续或取消。")
+            if not self.robot_allowed:
+                raise ControlError("预览模式无法进行实机标定。")
+            if (self._companion_client is not None or self._armed or self._agent_plan is not None
+                    or self._teach.active or self._base_calibration is not None or self._range_state != "IDLE"):
+                raise ControlError("请先暂停当前机械臂动作，再开始标定。")
+            self._gaze_client, self._gaze_epoch = client_id, self._epoch
+            self._gaze_preparing = True
+            self._gaze_requested_at = now
+            self._gaze_stop_sequence = self._stop_sequence
+            self._gaze_prepare_sample = None
+            self._gaze_preparation_detail = ""
+            self._gaze_phase = "countdown"
+            self._gaze_has_written = False
+            self._gaze_raw_observation = None
+            self._gaze_calibrator = None
+            self._gaze_tick_at = None
+            self._gaze_state, self._gaze_reason = "preparing", "3 秒后开始找脸，请看向镜头。"
+            self._gaze_progress, self._gaze_error = 0.0, None
+            self._gaze_fault_code = None
+            return {"ok": True, "gaze": self._gaze_status_locked()}
+
+    def _cancel_gaze_locked(self, reason: str) -> None:
+        if self._gaze_client is None:
+            return
+        had_motion = self._gaze_has_written
+        self._gaze_client = None
+        self._epoch += 1
+        self._gaze_calibrator = None
+        self._gaze_tick_at = None
+        self._gaze_epoch = None
+        self._gaze_preparing = False
+        self._gaze_requested_at = None
+        self._gaze_prepare_sample = None
+        self._gaze_phase = "cancelled"
+        self._gaze_has_written = False
+        self._gaze_state, self._gaze_reason = "fault", reason
+        self._motion_stop.set()
+        if had_motion:
+            self._agent_hold_pending = True
+            self._agent_raw_hold_pending = True
+        if self._gaze_controller is not None:
+            self._gaze_controller.reset_feedback()
+
+    def _save_gaze_calibration(self, calibration: GazeCalibration | None) -> None:
+        if self._gaze_path is None:
+            return
+        payload = calibration.to_dict() if calibration is not None else {"version": 1, "invalidated": True}
+        atomic_write_gaze(self._gaze_path, payload)
+
+    def _observe_gaze_positions(self, robot: SO101RobotAdapter) -> dict[str, Any]:
+        """Read raw and normalized positions together, on the serial owner only."""
+        observation = robot.read_calibration_observation()
+        if not isinstance(observation, dict) or set(observation["positions"]) != set(ALL_JOINTS):
+            raise ValueError("Incomplete calibrated position observation.")
+        if not all(math.isfinite(float(value)) for value in observation["positions"].values()):
+            raise ValueError("Non-finite calibrated position observation.")
+        with self._lock:
+            self._gaze_raw_observation = observation
+        return observation
+
+    def _reject_gaze_observation_locked(self, observation: dict[str, Any], joints: tuple[str, ...]) -> bool:
+        clipped = set(observation["clipped_joints"]) & set(joints)
+        if not clipped:
+            return False
+        self._gaze_raw_observation = observation
+        labels = {"shoulder_pan.pos": "底座", "wrist_flex.pos": "腕部"}
+        names = "、".join(labels.get(joint, joint) for joint in ALL_JOINTS if joint in clipped)
+        reason = f"{names}当前姿态超出舵机校准记录，需要先检查舵机校准。"
+        self._cancel_gaze_locked(reason)
+        if self._companion_client is not None:
+            self._disable_companion_locked(reason)
+        self._gaze_state, self._gaze_phase = "fault", "calibration_range_mismatch"
+        self._gaze_reason = self._gaze_preparation_detail = reason
+        self._gaze_fault_code = "raw_outside_calibration"
+        return True
+
+    def _fail_gaze_read_locked(self) -> None:
+        reason = "无法读取原始舵机位置，已停止探测。"
+        self._cancel_gaze_locked(reason)
+        if self._companion_client is not None:
+            self._disable_companion_locked(reason)
+        self._gaze_state, self._gaze_phase = "fault", "calibration_read_failed"
+        self._gaze_reason = reason
+        self._gaze_fault_code = "raw_read_failed"
+        self._gaze_raw_observation = None
+
+    def _poll_gaze_preparation(self, now: float) -> None:
+        """After an explicit click, wait for setup without issuing servo goals."""
+        with self._lock:
+            client_id = self._gaze_client
+            epoch = self._gaze_epoch
+            if client_id is None or not self._gaze_preparing:
+                return
+            if (not self._lease_valid_locked(client_id, now) or epoch != self._epoch
+                    or self._gaze_stop_sequence != self._stop_sequence):
+                self._cancel_gaze_locked("标定准备已取消。")
+                return
+            elapsed = now - self._gaze_requested_at
+            if elapsed > 63.0:
+                self._cancel_gaze_locked("本次等待已结束，需要时可重新点击开始。")
+                return
+            if elapsed < 3.0:
+                self._gaze_phase = "countdown"
+                self._gaze_reason = f"{math.ceil(3.0 - elapsed)} 秒后开始找脸，请看向镜头。"
+                return
+            if self._robot is None or not self._robot.connected:
+                self._gaze_phase, self._gaze_reason = "waiting_robot", "先在上方连接机械臂。"
+                self._gaze_prepare_sample = None
+                return
+            if not self._companion_robot_available_locked() or self._agent_hold_pending:
+                self._gaze_phase, self._gaze_reason = "waiting_motion", "等待当前机械臂操作结束。"
+                self._gaze_prepare_sample = None
+                return
+            if self._gaze_tick_at is not None and now - self._gaze_tick_at < 0.15:
+                return
+            self._gaze_tick_at = now
+            robot = self._robot
+        try:
+            # This is encoder observation, never a clamped pose or a motor goal.
+            observation = self._observe_gaze_positions(robot)
+            measured = dict(observation["positions"])
+            with self._lock:
+                if (self._gaze_client != client_id or not self._gaze_preparing or self._epoch != epoch
+                        or self._gaze_stop_sequence != self._stop_sequence
+                        or not self._lease_valid_locked(client_id, time.monotonic()) or self._robot is not robot):
+                    self._cancel_gaze_locked("标定准备已取消。")
+                    return
+                self._range_current = dict(measured)
+                if self._reject_gaze_observation_locked(observation, ("shoulder_pan.pos", "wrist_flex.pos")):
+                    return
+                blocked = self._gaze_calibration_block_reason_locked(time.monotonic(), ignore_active=True)
+                self._gaze_preparation_detail = blocked
+                if blocked:
+                    self._gaze_prepare_sample = None
+                    if not self._companion_camera_ready_locked(time.monotonic(), client_id):
+                        phase, reason = "waiting_camera", "先连接腕部相机。"
+                    elif "ID1" in blocked:
+                        phase, reason = "waiting_pose", "底座超出可转范围，需要先调整起始姿态。"
+                    elif "ID4" in blocked:
+                        phase, reason = "waiting_pose", "腕部缺少探测空间，需要先调整起始姿态。"
+                    elif self._visual_proximity.state in {"TOO_CLOSE", "SLOW"}:
+                        phase, reason = "waiting_distance", "离镜头稍远一点。"
+                    else:
+                        phase, reason = "waiting_face", "等你看向镜头，看到脸后会自动采集。"
+                    self._gaze_phase, self._gaze_reason = phase, reason
+                    return
+                frame_at = self._companion_frame_at
+                center = self._gaze_target_locked(time.monotonic(), client_id)
+                track_id = self._detection.head_track_id
+                sample = self._gaze_prepare_sample
+                changed = (sample is None or sample["track_id"] != track_id
+                           or max(abs(center[i] - sample["center"][i]) for i in range(2)) > 0.025
+                           or any(abs(measured[joint] - sample["positions"][joint]) > 0.4
+                                  for joint in ALL_JOINTS if joint != "gripper.pos"))
+                if changed:
+                    sample = {"track_id": track_id, "center": center, "positions": dict(measured),
+                              "first_frame": frame_at, "last_frame": frame_at, "frames": 1}
+                    self._gaze_prepare_sample = sample
+                elif frame_at > sample["last_frame"]:
+                    sample["last_frame"] = frame_at
+                    sample["frames"] += 1
+                self._gaze_phase, self._gaze_reason = "stabilizing", "看到你了，正在准备采集。"
+                if sample["frames"] < 3 or frame_at - sample["first_frame"] < 0.5:
+                    return
+                if self._gaze_stop_sequence != self._stop_sequence:
+                    self._cancel_gaze_locked("标定准备已取消。")
+                    return
+                self._gaze_preparing = False
+                self._gaze_tick_at = None
+                self._gaze_state, self._gaze_phase = "calibrating", "baseline"
+                self._gaze_reason = "开始采集，保持自然姿态即可。"
+                self._motion_stop.clear()
+        except Exception as exc:
+            with self._lock:
+                self._fail_gaze_read_locked()
+            LOGGER.warning("gaze preparation position read failed | %s", exc)
+
+    def _poll_gaze_calibration(self, now: float) -> None:
+        with self._send_lock:
+            with self._lock:
+                preparing = self._gaze_preparing and self._gaze_client is not None
+            if preparing:
+                self._poll_gaze_preparation(now)
+                return
+            with self._lock:
+                client_id = self._gaze_client
+                if client_id is None:
+                    return
+                if self._motion_stop.is_set() or self._gaze_stop_sequence != self._stop_sequence:
+                    self._cancel_gaze_locked("注视标定收到停止请求，保持当前位置。")
+                    return
+                center = self._gaze_target_locked(now, client_id)
+                if (not self._lease_valid_locked(client_id, now) or self._gaze_epoch != self._epoch
+                        or not self._companion_robot_available_locked() or center is None):
+                    self._cancel_gaze_locked("注视标定已暂停：画面、目标或控制状态发生变化，请确认后重试。")
+                    return
+                if self._gaze_tick_at is not None and now - self._gaze_tick_at < COMPANION_CONTROL_PERIOD_S:
+                    return
+                if self._agent_hold_pending:
+                    return
+                self._gaze_tick_at = now
+                frame_at = self._companion_frame_at
+                target_id = self._detection.head_track_id
+                robot, epoch = self._robot, self._epoch
+                calibrator = self._gaze_calibrator
+            try:
+                try:
+                    observation = self._observe_gaze_positions(robot)
+                except Exception:
+                    with self._lock:
+                        self._fail_gaze_read_locked()
+                    LOGGER.exception("gaze calibration raw read failed")
+                    return
+                measured = dict(observation["positions"])
+                with self._lock:
+                    if self._reject_gaze_observation_locked(observation, ("shoulder_pan.pos", "wrist_flex.pos")):
+                        return
+                if calibrator is None:
+                    self._save_gaze_calibration(None)
+                    limits = self.companion_joint_limits()
+                    calibrator = GazeCalibrator(
+                        {joint: limits[joint] for joint in ("shoulder_pan.pos", "wrist_flex.pos")},
+                        metadata=self._gaze_metadata_locked(),
+                        max_step=min(0.2, self.config.safety.max_step_per_cycle),
+                    )
+                    step = calibrator.begin(measured, center, frame_at, now, target_id)
+                else:
+                    step = calibrator.update(measured, center, frame_at, now, target_id)
+                with self._lock:
+                    if self._gaze_client != client_id or self._epoch != epoch:
+                        return
+                    self._gaze_calibrator = calibrator
+                    self._gaze_reason = {
+                        "baseline": "正在采集静止人脸，请保持头部不动。",
+                        "probe_yaw": "正在小幅转动底座，测量左右方向，请保持头部不动。",
+                        "return_yaw": "底座正在回到探测起点，请保持头部不动。",
+                        "baseline_pitch": "正在确认腕部探测前的人脸位置。",
+                        "probe_pitch": "正在小幅转动腕部，测量上下方向，请保持头部不动。",
+                        "return_pitch": "腕部正在回到探测起点，请保持头部不动。",
+                    }.get(step.state, self._gaze_reason)
+                    self._gaze_phase = step.state
+                    self._gaze_progress = step.progress
+                    if step.state == "aborted":
+                        LOGGER.warning("gaze calibration aborted | %s", step.reason)
+                        if "response" in step.reason or "observable" in step.reason:
+                            message = "两轴的图像响应不足或无法区分，请调整机械臂姿态和镜头方向后重新标定。"
+                        elif "limit" in step.reason or "travel" in step.reason or "bounds" in step.reason:
+                            message = "关节靠近允许范围边缘，请恢复到舒适中间姿态后重新标定。"
+                        elif "timed out" in step.reason:
+                            message = "标定超时，已保持。请让人脸清楚入镜并保持头部静止后重试。"
+                        else:
+                            message = "标定期间头部或关节反馈不稳定，已保持当前位置。请保持同一张脸和其他关节静止后重试。"
+                        self._cancel_gaze_locked(message)
+                        return
+                if step.calibration is not None:
+                    with self._lock:
+                        if (self._motion_stop.is_set() or self._gaze_client != client_id
+                                or self._gaze_stop_sequence != self._stop_sequence
+                                or self._epoch != epoch or not self._lease_valid_locked(client_id, time.monotonic())
+                                or self._detection.head_track_id != target_id
+                                or self._gaze_target_locked(time.monotonic(), client_id) is None):
+                            self._cancel_gaze_locked("注视标定完成前收到停止或目标变化，结果未保存。")
+                            return
+                    self._save_gaze_calibration(step.calibration)
+                    with self._lock:
+                        if (self._motion_stop.is_set() or self._gaze_client != client_id or self._epoch != epoch
+                                or self._gaze_stop_sequence != self._stop_sequence
+                                or not self._lease_valid_locked(client_id, time.monotonic())
+                                or self._detection.head_track_id != target_id
+                                or self._gaze_target_locked(time.monotonic(), client_id) is None):
+                            self._save_gaze_calibration(None)
+                            self._cancel_gaze_locked("注视标定保存时收到停止或目标变化，请重新标定。")
+                            return
+                        self._gaze_calibration = step.calibration
+                        self._gaze_controller = ImageGazeController(step.calibration)
+                        self._gaze_client = None
+                        self._gaze_calibrator = None
+                        self._gaze_epoch = None
+                        self._gaze_phase = "complete"
+                        self._gaze_has_written = False
+                        self._gaze_state, self._gaze_reason = "ready", "注视方向标定完成，可以开启陪伴。"
+                        self._gaze_progress = 1.0
+                        self._motion_stop.set()
+                        self._agent_hold_pending = True
+                        self._agent_raw_hold_pending = True
+                    LOGGER.info("gaze calibration completed | jacobian=%s", step.calibration.jacobian)
+                    return
+                if not step.targets:
+                    return
+                targets = dict(step.targets)
+                def before_write(observed: dict[str, float]) -> bool:
+                    with self._lock:
+                        check_now = time.monotonic()
+                        fresh = self._gaze_target_locked(check_now, client_id)
+                        if (self._motion_stop.is_set() or self._gaze_client != client_id
+                                or self._gaze_stop_sequence != self._stop_sequence
+                                or self._epoch != epoch or not self._lease_valid_locked(client_id, check_now)
+                                or self._detection.head_track_id != target_id or fresh is None
+                                or not self._companion_robot_available_locked()):
+                            self._cancel_gaze_locked("注视标定已暂停：目标或控制状态变化。")
+                            return False
+                        limits = self.companion_joint_limits()
+                        for joint, target in targets.items():
+                            current = float(observed[joint])
+                            low, high = limits[joint]
+                            if (not math.isfinite(current) or not low <= current <= high
+                                    or not low <= target <= high or abs(target - current) > 0.75):
+                                self._cancel_gaze_locked("注视标定中关节反馈偏差过大，已保持。")
+                                return False
+                        self._gaze_has_written = True
+                        return True
+                sent, observed = robot.send_agent_targets(
+                    targets, tuple(targets), {}, before_write=before_write, verify_calibrated_raw=True,
+                    raw_guard_joints=("shoulder_pan.pos", "wrist_flex.pos"),
+                )
+                with self._lock:
+                    if self._gaze_client == client_id:
+                        self._gaze_has_written = True
+                    self._range_current = dict(observed)
+                    self._last_action = dict(sent)
+                    self._last_send_time = now
+            except CalibrationRangeError as exc:
+                with self._lock:
+                    self._reject_gaze_observation_locked(exc.observation, exc.joints)
+                LOGGER.warning("gaze write refused outside calibration | joints=%s", exc.joints)
+            except (ControlError, ValueError, OSError) as exc:
+                with self._lock:
+                    self._cancel_gaze_locked(f"注视标定失败：{exc}")
+                LOGGER.warning("gaze calibration rejected | %s", exc)
+            except Exception as exc:
+                self.disarm("gaze calibration I/O failed")
+                with self._lock:
+                    self._robot_state, self._error = "FAULT", f"注视标定通信失败：{exc}"
+                LOGGER.exception("gaze calibration I/O failed")
+
+    def set_companion(
+        self, *, client_id: str, enabled: bool, allow_unoccupied_idle: bool,
+        expected_epoch: int | None, allow_vertical_search: bool = False,
+    ) -> dict[str, Any]:
+        now = time.monotonic()
+        with self._send_lock, self._lock:
+            if not self._lease_valid_locked(client_id, now):
+                raise ControlError("请先取得网页控制权。")
+            if not enabled:
+                self._disable_companion_locked()
+                return {"ok": True, "companion": self._companion_status_locked()}
+            if expected_epoch != self._epoch:
+                raise ControlError("控制状态已更新。请确认后重新点击开启陪伴。")
+            if self._robot_state == "FAULT" or self._error is not None:
+                raise ControlError(f"从臂故障，请检查并重连。{self._error or ''}")
+            if not self.robot_allowed or not self._companion_robot_available_locked():
+                raise ControlError("请先连接已校准的从臂，并结束当前真机操作。")
+            if not self._companion_camera_ready_locked(now, client_id):
+                raise ControlError(f"请先连接腕部相机 {self.config.camera.wrist_name} 并确认画面正常。")
+            if not self._gaze_ready_locked():
+                raise ControlError(self._gaze_status_locked()["reason"])
+
+            self._stop_companion_motion_locked(reset=True)
+            self._companion_client = client_id
+            self._companion_presence = None
+            self._companion_last_eligible_at = None
+            self._companion_allow_search = allow_unoccupied_idle
+            self._companion_allow_vertical_search = bool(allow_unoccupied_idle and allow_vertical_search)
+            self._companion_interaction_until = 0.0
+            self._companion_search_at = None
+            self._companion_track_id = None
+            self._companion_state = "checking_presence"
+            self._companion_reason = "正在确认腕部相机画面。"
+            return {"ok": True, "companion": self._companion_status_locked()}
+
+    def _stop_companion_motion_locked(self, *, reset: bool = False) -> None:
+        if self._companion_last_tick is not None:
+            self._companion_last_tick = None
+            self._motion_stop.set()
+            self._agent_hold_pending = True
+            self._agent_raw_hold_pending = True
+        if reset:
+            self._companion_motion = None
+            self._companion_presence = None
+            self._companion_last_probe_at = None
+            self._companion_last_eligible_at = None
+        if self._gaze_controller is not None:
+            self._gaze_controller.reset_feedback()
+
+    def _disable_companion_locked(self, reason: str = "陪伴模式已关闭。") -> None:
+        self._stop_companion_motion_locked(reset=True)
+        self._companion_client = None
+        self._companion_state = "off"
+        self._companion_reason = reason
+
+    def _wrist_camera_selected_locked(self) -> bool:
+        return bool(self._camera_name and self._camera_name.casefold() == self.config.camera.wrist_name.casefold())
+
+    def _companion_camera_ready_locked(self, now: float, client_id: str | None) -> bool:
+        return bool(
+            client_id and self._camera_owner == client_id
+            and self._wrist_camera_selected_locked()
+            and self._preview_state == "RUNNING"
+            and self._companion_frame_at is not None
+            and now - self._companion_frame_at <= min(
+                COMPANION_FRAME_MAX_AGE_S, self.config.safety.tracking_timeout_s,
+            )
+        )
+
+    def _companion_status_locked(self) -> dict[str, Any]:
+        camera_ready = self._companion_camera_ready_locked(time.monotonic(), self._camera_owner)
+        center = head_target(self._detection) if camera_ready else None
+        return {
+            "enabled": self._companion_client is not None,
+            "state": self._companion_state,
+            "reason": self._companion_reason,
+            "camera_name": self.config.camera.wrist_name,
+            "wrist_camera": self._wrist_camera_selected_locked(),
+            "camera_ready": camera_ready,
+            "person_visible": camera_ready and (self._detection.people_count == 1 or center is not None),
+            "head_visible": center is not None,
+            "head_center": center,
+            "head_source": getattr(self._detection, "head_source", None) or ("pose_points" if center else None),
+            "allow_unoccupied_idle": self._companion_allow_search,
+            "allow_vertical_search": self._companion_allow_vertical_search,
+            "gaze": self._gaze_status_locked(),
+        }
+
+    def _companion_robot_available_locked(self) -> bool:
+        return bool(
+            self._robot is not None and self._robot.connected
+            and self._robot_state == "CONNECTED_DISARMED" and not self._armed
+            and self._agent_plan is None and self._safe_profile is not None
+            and self._range_state == "IDLE" and self._base_calibration is None
+            and not self._collecting_neutral and not self._teach.active
+            and not self._release_pending and self._error is None
+        )
+
+    def _companion_view_locked(self, now: float) -> tuple[str, str, tuple[float, float] | None]:
+        people = self._detection.people_count
+        proximity = self._visual_proximity.state
+        if not self._companion_camera_ready_locked(now, self._companion_client):
+            return "waiting_camera", "正在等待腕部相机的新鲜画面。", None
+        if (people > 1 or self._detection.reason in {"person changed", "multiple people"}
+                or getattr(self._detection, "head_source", None) == "ambiguous"):
+            return "ambiguous", "目标不稳定，已暂停动作。", None
+        if proximity == "TOO_CLOSE":
+            return "too_close", "人或手在画面中看起来太近，已暂停陪伴动作。", None
+        if getattr(self._detection, "head_state", "") in {"confirming", "unverified", "unavailable"}:
+            return "waiting_face", "正在复核人脸，保持镜头方向，避免追踪误检目标。", None
+        if proximity in {"SAFE", "SLOW"}:
+            center = head_target(self._detection)
+            if center is not None:
+                reason = "已定位头部，正在把头部保持在画面中央。识别到手势时夹爪会跟随。"
+                if proximity == "SLOW":
+                    reason = "已定位头部，目标偏近，正在减小摆动并保持居中。"
+                return "moving", reason, center
+            if companion_hand_openness(self._detection) is not None:
+                return "moving", "暂未看清面部，保持镜头方向，夹爪继续跟随手势。", None
+        if ((people == 1 or self._detection.hand_landmarks or head_target(self._detection) is not None)
+                and not (self._companion_allow_search and self._companion_allow_vertical_search)):
+            return "waiting_face", "正在寻找可靠的头部目标，暂时保持镜头方向。", None
+        if not self._companion_allow_search:
+            return "waiting_person", "等待面部入镜。需要无人搜索时，确认运动范围已隔离后重新开启陪伴。", None
+        if (self._companion_motion is not None
+                and not self._companion_motion.can_search(vertical=self._companion_allow_vertical_search)):
+            return "search_blocked", self._companion_motion.blocked_reason, None
+        reason = "尚未锁定头部，底座和腕部正在限位内小幅左右、上下搜索。" if self._companion_allow_vertical_search else "尚未锁定头部，底座正在限位内左右搜索。"
+        return "searching", reason, None
+
+    def _poll_companion(self, now: float) -> None:
+        with self._send_lock:
+            with self._lock:
+                client_id = self._companion_client
+                if client_id is None or not self._lease_valid_locked(client_id, now):
+                    return
+                state, reason, center = self._companion_view_locked(now)
+                if state in {"moving", "searching"} and not self._gaze_ready_locked():
+                    state, reason = "gaze_required", self._gaze_status_locked()["reason"]
+                track_id = getattr(self._detection, "head_track_id", None)
+                if center is not None:
+                    self._companion_search_at = None
+                    if track_id != self._companion_track_id:
+                        self._companion_presence = None
+                        if self._gaze_controller is not None:
+                            self._gaze_controller.reset_feedback()
+                        self._companion_track_id = track_id
+                elif state == "searching":
+                    if self._companion_search_at is None:
+                        self._companion_search_at = now
+                    if now - self._companion_search_at > 8.0:
+                        state, reason = "search_timeout", "本轮找头已超时，保持当前位置。请让脸进入镜头或暂停后重新开始。"
+                eligible = state in {"moving", "searching"}
+                if not eligible:
+                    # Hold immediately on a missing target, but a brief detector
+                    # dropout need not restart the entire confirmation interval.
+                    short_gap = (
+                        state in {"waiting_face", "waiting_person"}
+                        and self._companion_last_eligible_at is not None
+                        and now - self._companion_last_eligible_at <= COMPANION_TARGET_GAP_S
+                    )
+                    if not short_gap:
+                        self._companion_presence = None
+                else:
+                    self._companion_last_eligible_at = now
+                    if self._companion_presence is None or self._companion_presence[0] != state:
+                        self._companion_presence = (state, now)
+                    if now - self._companion_presence[1] < COMPANION_PRESENCE_CONFIRM_S:
+                        state, reason = "checking_presence", "正在确认腕部相机中的目标。"
+                    elif not self._companion_robot_available_locked() or self._agent_hold_pending:
+                        state, reason = "waiting_motion", "正在等待当前真机动作结束。"
+                    elif now < self._companion_interaction_until:
+                        state, reason = "cooldown", "正在等待对话动作，结束后继续陪伴。"
+                if state == "moving" and center is not None and self._companion_motion is not None:
+                    if self._companion_motion.blocked_reason:
+                        reason += " " + self._companion_motion.blocked_reason
+                    if self._companion_motion.gaze_limit_reason:
+                        reason += " " + self._companion_motion.gaze_limit_reason
+                self._companion_state, self._companion_reason = state, reason
+                if state not in {"moving", "searching"}:
+                    if self._gaze_state not in {"fault", "pose_changed", "uncalibrated"}:
+                        self._gaze_state, self._gaze_reason = "holding", reason
+                        if center is None:
+                            self._gaze_error = None
+                    self._stop_companion_motion_locked()
+                    return
+                last_tick = self._companion_last_tick
+                motion = self._companion_motion
+                hand_open = companion_hand_openness(self._detection) if state == "moving" else None
+                if last_tick is not None and motion is not None and motion.gripper_active and hand_open is None:
+                    # Cancel the last powered goal on hand loss before resuming camera motion.
+                    self._stop_companion_motion_locked()
+                    return
+                if last_tick is not None and (
+                    self._motion_stop.is_set() or now - last_tick < COMPANION_CONTROL_PERIOD_S
+                ):
+                    return
+                robot = self._robot
+                frame_at = self._companion_frame_at
+                gaze_controller = self._gaze_controller
+                amplitude = 0.6 if self._visual_proximity.state == "SLOW" else 1.0
+                vertical_search = self._companion_allow_vertical_search
+                dt = COMPANION_CONTROL_PERIOD_S if last_tick is None else now - last_tick
+                if last_tick is None:
+                    if (self._companion_last_probe_at is not None
+                            and now - self._companion_last_probe_at < COMPANION_CONTROL_PERIOD_S):
+                        return
+                    self._companion_last_probe_at = now
+                    self._motion_stop.clear()
+                    self._companion_last_tick = now
+
+            try:
+                try:
+                    observation = self._observe_gaze_positions(robot)
+                except Exception:
+                    with self._lock:
+                        self._fail_gaze_read_locked()
+                    LOGGER.exception("companion raw read failed")
+                    return
+                measured = dict(observation["positions"])
+                if last_tick is None:
+                    if motion is None:
+                        motion = CompanionMotion(
+                            measured, self.companion_joint_limits(),
+                            gripper_open_is_high=self.config.mapping.signs["gripper.pos"] >= 0.0,
+                        )
+                    else:
+                        motion.resume_from(measured)
+                motion.measured_positions(measured)
+                with self._lock:
+                    active = tuple(motion.measured_positions(measured))
+                    if hand_open is not None:
+                        active += ("gripper.pos",)
+                    if self._reject_gaze_observation_locked(observation, active):
+                        return
+                gaze_delta = None
+                if state == "moving" and center is not None:
+                    result = gaze_controller.update(center, measured, frame_at, now, track_id)
+                    with self._lock:
+                        self._gaze_error = result.error
+                        self._gaze_fault_code = result.fault_code
+                        self._gaze_state = {
+                            "invalid": "pose_changed", "waiting_frame": "holding",
+                            "target_changed": "holding", "target_lost": "holding", "stale": "holding",
+                        }.get(result.state, result.state)
+                        self._gaze_reason = {
+                            "invalid": "相机姿态或关节反馈超出标定适用范围，请暂停并重新标定。",
+                            "fault": "纠偏后人脸偏差持续增大，已保持，请检查目标并重新标定。",
+                            "waiting_frame": "等待新的人脸画面。",
+                            "target_changed": "头部目标变化，正在重新确认。",
+                            "target_lost": "头部丢失，保持镜头方向。",
+                            "stale": "画面过期，保持镜头方向。",
+                            "centered": "头部已在画面中央，持续保持注视。",
+                            "tracking": "正在根据实测方向把头部保持在画面中央。",
+                        }.get(result.state, result.reason)
+                        if result.fault_code == "stalled":
+                            self._gaze_reason = "已请求纠偏，但关节实测位置持续未响应，已保持。请检查供电、负载和限位后重新标定。"
+                        elif result.fault_code == "not_converging":
+                            self._gaze_reason = "关节已运动，但人脸偏差持续没有改善，已保持。请检查目标和镜头方向后重新标定。"
+                        self._companion_motion = motion
+                        if result.state in {"fault", "invalid", "target_lost", "stale"}:
+                            self._companion_state, self._companion_reason = "gaze_required", self._gaze_reason
+                            self._stop_companion_motion_locked()
+                            if result.state in {"fault", "invalid"}:
+                                self._save_gaze_calibration(None)
+                            return
+                    if result.state in {"waiting_frame", "target_changed"}:
+                        # Do not integrate repeated camera frames or advance body motion.
+                        return
+                    gaze_delta = result.delta
+                if state == "searching" and not motion.can_search(vertical=vertical_search):
+                    with self._lock:
+                        self._companion_motion = motion
+                        self._companion_state = "search_blocked"
+                        self._companion_reason = motion.blocked_reason
+                        # No search goal was issued. In particular, don't write a
+                        # powered hold to a base already outside its safe limits.
+                        self._companion_last_tick = None
+                        self._motion_stop.set()
+                    return
+                targets = motion.step(
+                    dt, face_target=center, amplitude=amplitude, search=state == "searching",
+                    search_vertical=vertical_search,
+                    max_step=self.config.safety.max_step_per_cycle, hand_open=hand_open,
+                    gaze_delta=gaze_delta,
+                )
+                if not targets:
+                    with self._lock:
+                        self._companion_motion = motion
+                        self._companion_state = "range_blocked"
+                        self._companion_reason = motion.blocked_reason or "当前没有可安全执行的陪伴关节。"
+                        self._companion_last_tick = None
+                        self._motion_stop.set()
+                    return
+
+                def before_write(observed: dict[str, float]) -> bool:
+                    with self._lock:
+                        fresh_now = time.monotonic()
+                        fresh_state, _, fresh_center = self._companion_view_locked(fresh_now)
+                        if (self._motion_stop.is_set() or not self._lease_valid_locked(client_id, fresh_now)
+                                or fresh_state != state or (fresh_center is None) != (center is None)
+                                or not self._gaze_ready_locked()
+                                or (center is not None and (frame_at is None or not -0.02 <= fresh_now - frame_at <= 0.25))
+                                or getattr(self._detection, "head_track_id", None) != track_id
+                                or ("gripper.pos" in targets and companion_hand_openness(self._detection) is None)):
+                            self._stop_companion_motion_locked()
+                            return False
+                        motion.measured_positions(observed)
+                        if "gripper.pos" in targets:
+                            motion.validate_gripper_position(observed.get("gripper.pos"))
+                        return True
+
+                sent, observed = robot.send_agent_targets(
+                    targets, tuple(targets), {}, before_write=before_write, verify_calibrated_raw=True,
+                )
+                with self._lock:
+                    if self._companion_last_tick is None:
+                        return
+                    self._companion_motion = motion
+                    self._companion_last_tick = now
+                    if center is not None and motion.gaze_limit_reason:
+                        self._gaze_state, self._gaze_reason = "fault", motion.gaze_limit_reason
+                        self._companion_reason = motion.gaze_limit_reason
+                        self._stop_companion_motion_locked()
+                        self._save_gaze_calibration(None)
+                    self._last_action = dict(sent)
+                    self._range_current = dict(observed)
+                    self._last_send_time = now
+            except CalibrationRangeError as exc:
+                with self._lock:
+                    self._reject_gaze_observation_locked(exc.observation, exc.joints)
+                LOGGER.warning("companion write refused outside calibration | joints=%s", exc.joints)
+            except CompanionRangeError as exc:
+                with self._lock:
+                    # Cancel the outstanding goal, then re-read encoders before
+                    # selecting safe axes. Keep the user's companion session on.
+                    self._stop_companion_motion_locked(reset=True)
+                    self._companion_state = "range_blocked"
+                    self._companion_reason = f"{exc} 正在暂停该轴并继续其他安全关节。"
+                LOGGER.warning("companion axis paused at range boundary | %s", exc)
+            except (ControlError, ValueError) as exc:
+                with self._lock:
+                    self._disable_companion_locked(f"陪伴动作已停止：{exc}")
+                LOGGER.warning("companion motion rejected | %s", exc)
+            except Exception as exc:
+                self.disarm("companion servo I/O failed")
+                with self._lock:
+                    self._robot_state = "FAULT"
+                    self._error = f"陪伴动作发送失败：{exc}"
+                    self._companion_reason = self._error
+                LOGGER.exception("companion servo I/O failed")
+
     def connect_camera(self, name: str, *, client_id: str) -> dict[str, Any]:
         name = name.strip()
         with self._frame_condition:
@@ -904,7 +1778,17 @@ class ControlEngine:
                 return self._camera_status_locked()
             if self._vision_stop is not None:
                 self._vision_stop.set()
+            keep_preparing = bool(self._gaze_preparing and expired_owner is None
+                                  and self._camera_owner == self._gaze_client
+                                  and self._lease_valid_locked(self._gaze_client, time.monotonic()))
             self._camera_owner = None
+            if keep_preparing:
+                self._gaze_prepare_sample = None
+                self._gaze_phase, self._gaze_reason = "waiting_camera", "先连接腕部相机。"
+            else:
+                self._cancel_gaze_locked("相机已断开，注视标定已停止。")
+            if self._companion_client is not None:
+                self._disable_companion_locked("腕部相机已断开，陪伴模式已关闭。")
             if self._armed:
                 self.disarm("相机已断开，人体跟随已停止。")
             self._clear_camera_tracking_locked("camera disconnected")
@@ -915,8 +1799,11 @@ class ControlEngine:
             return self._camera_status_locked()
 
     def _clear_camera_tracking_locked(self, reason: str) -> None:
+        if self._gaze_preparing:
+            self._gaze_prepare_sample = None
         self._latest_jpeg = None
         self._last_frame_time = None
+        self._companion_frame_at = None
         self._detection = PoseDetection(None, (), 0, reason)
         self._latest_features = None
         self._latest_valid_features = frozenset()
@@ -1019,6 +1906,17 @@ class ControlEngine:
     def _execute_command(self, command: ControlCommand) -> dict[str, Any]:
         name = command.name
         payload = command.payload
+        preparing_connect = (self._gaze_preparing and name == "connect"
+                             and command.client_id == self._gaze_client)
+        if self._gaze_client is not None and name not in {"disconnect", "shutdown"} and not preparing_connect:
+            raise ControlError("正在进行注视方向标定，请先取消或停止，再执行其他真机操作。")
+        if (self._companion_client is not None and name in {
+            "arm", "collect_neutral", "start_base_calibration", "capture_fixed",
+            "start_safe_range", "teach_calibration_start", "teach_recording_start",
+        }):
+            with self._send_lock, self._lock:
+                self._disable_companion_locked("其他真机操作已接管，陪伴模式已关闭。")
+            self._hold_agent_if_pending()
         if name.startswith("teach_"):
             return self._execute_teach_command(command)
         if self._teach.active and name in {
@@ -1363,6 +2261,21 @@ class ControlEngine:
                      "leader_sample_age_ms": round((io_started_at - target_at) * 1000, 1)},
         )
 
+    def companion_joint_limits(self) -> dict[str, tuple[float, float]]:
+        """Companion starts at the chosen pose within calibrated motor travel."""
+        with self._lock:
+            if self._companion_mechanical_limits is None:
+                raise ControlError("缺少已校准的舵机运动范围，请先连接机械臂。")
+            limits = dict(self._companion_mechanical_limits)
+            # A deliberately collected manual envelope still applies. The
+            # configuration-only human-mimic envelope is not a companion zero.
+            if self._safe_profile is not None and not self.config.safety.skip_safe_range_calibration:
+                for joint, (low, high) in self._safe_profile.controlled_limits.items():
+                    limits[joint] = max(limits[joint][0], low), min(limits[joint][1], high)
+            if any(not math.isfinite(low + high) or low >= high for low, high in limits.values()):
+                raise ControlError("陪伴模式的舵机运动范围无效。")
+            return limits
+
     def agent_joint_limits(self) -> dict[str, tuple[float, float]]:
         """Agent/editor envelope; the live-follow four-axis profile stays intact."""
         with self._lock:
@@ -1388,7 +2301,8 @@ class ControlEngine:
                     "error": self._agent_motion_error,
                 },
                 "can_move": bool(connected and self._lease_valid_locked(client_id, time.monotonic())
-                                 and self._robot_state == "CONNECTED_DISARMED" and self._agent_plan is None
+                                 and self._robot_state == "CONNECTED_DISARMED"
+                                 and self._agent_plan is None and self._gaze_client is None
                                  and not self._armed and not self._release_pending and not self._teach.active),
             }
 
@@ -1520,6 +2434,7 @@ class ControlEngine:
                 raise ControlError(
                     "Agent motion requires a connected, DISARMED robot; stop human following first."
                 )
+            self._stop_companion_motion_locked()
             if self._agent_plan is not None:
                 raise ControlError("上一个机械臂动作仍在执行或回位，请完成后再发送，或先点击停止。")
             if self._safe_profile is None:
@@ -1643,6 +2558,7 @@ class ControlEngine:
             except (TypeError, ValueError) as exc:
                 raise ControlError(f"Invalid Agent motion plan: {exc}") from exc
 
+            self._companion_motion = None
             self._epoch += 1
             self._agent_plan = plan
             self._agent_timing = timing
@@ -1692,7 +2608,7 @@ class ControlEngine:
             self._message = self._agent_motion_message
 
         LOGGER.info(
-            "agent motion scheduled | name=%s keyframes=%d visual_guard=disabled state=%s start_measured=%s",
+            "agent motion scheduled | name=%s keyframes=%d state=%s start_measured=%s",
             plan.name,
             len(plan.keyframes),
             self._agent_motion_state,
@@ -1913,6 +2829,7 @@ class ControlEngine:
         if plan.clear_pet_restore_on_complete:
             self._pet_restore_positions = None
         self._agent_hold_pending = False
+        self._agent_raw_hold_pending = False
         touched = {joint for frame in plan.keyframes for joint in frame.active_joints}
         self._agent_return_verified = bool(
             touched and self._agent_recovery_positions is not None and self._range_current is not None
@@ -1930,6 +2847,8 @@ class ControlEngine:
         self._agent_last_snapshot = {"motion_id": self._agent_plan_epoch, "state": "COMPLETE",
                                      "completed_actions": copy.deepcopy(self._agent_semantic_actions),
                                      "pending_actions": [], "progress_note": "All previous actions finished; do not repeat them."}
+        if self._companion_client is not None:
+            self._companion_interaction_until = time.monotonic() + 0.75
         self._agent_plan = None
         self._agent_plan_client = None
         self._agent_plan_epoch = None
@@ -1963,13 +2882,16 @@ class ControlEngine:
                 if not self._agent_hold_pending:
                     return
                 self._agent_hold_pending = False
+                raw_hold = self._agent_raw_hold_pending
+                self._agent_raw_hold_pending = False
                 robot = self._robot
                 if robot is None or not robot.connected or self._release_pending:
                     return
                 if getattr(robot, "manual_range_active", False) or getattr(robot, "fixed_positioning_active", False):
                     return
             try:
-                measured = robot.hold_current() if hasattr(robot, "hold_current") else robot.read_positions()
+                measured = (robot.hold_raw_current() if raw_hold else
+                            robot.hold_current() if hasattr(robot, "hold_current") else robot.read_positions())
                 with self._lock:
                     self._range_current = dict(measured)
                     self._last_action = dict(measured)
@@ -2343,6 +3265,7 @@ class ControlEngine:
         try:
             initial = adapter.connect()
             fingerprint = adapter.calibration_fingerprint()
+            companion_limits = adapter.normalized_joint_limits()
             controller = MotionController(initial, self.config.mapping, self.config.safety)
             profile = None
             profile_error = None
@@ -2362,6 +3285,7 @@ class ControlEngine:
                     controlled_limits=controlled_limits,
                     fixed_positions=fixed_positions,
                     startup_positions=initial,
+                    require_startup_middle=False,
                 )
                 controller = MotionController(
                     initial,
@@ -2410,6 +3334,7 @@ class ControlEngine:
             self._controller = controller
             self._initial = dict(initial)
             self._connection_positions = dict(initial)
+            self._companion_mechanical_limits = companion_limits
             self._last_action = controller.hold()
             self._calibration_fingerprint = fingerprint
             self._safe_profile = profile
@@ -2423,6 +3348,7 @@ class ControlEngine:
             self._agent_recovery_joints = ()
             self._agent_return_verified = False
             self._agent_hold_pending = False
+            self._agent_raw_hold_pending = False
             self._range_mins.clear()
             self._range_maxes.clear()
             self._neutral = None
@@ -2970,6 +3896,7 @@ class ControlEngine:
             self._controller = preview_controller
             self._initial = dict(preview_controller.initial)
             self._connection_positions = None
+            self._companion_mechanical_limits = None
             self._last_action = preview_controller.hold()
             self._calibration_fingerprint = None
             self._safe_profile = None
@@ -2983,6 +3910,7 @@ class ControlEngine:
             self._agent_recovery_joints = ()
             self._agent_return_verified = False
             self._agent_hold_pending = False
+            self._agent_raw_hold_pending = False
             self._range_mins.clear()
             self._range_maxes.clear()
             self._neutral = None
@@ -3007,8 +3935,8 @@ class ControlEngine:
                 raise ControlError(
                     "Torque release is queued or in progress; neutral-pose collection is not allowed."
                 )
-            if self._preview_state != "RUNNING" or self._latest_features is None:
-                raise ControlError("At least one reliable arm or hand channel is required.")
+            if self._preview_state != "RUNNING":
+                raise ControlError("请先连接相机，等预览画面出现后再采集中立姿势。")
             if self.robot_allowed and self._safe_profile is None:
                 raise ControlError("Complete and save the servo safe-range calibration first.")
             if self._range_state != "IDLE":
@@ -3019,10 +3947,10 @@ class ControlEngine:
             self._clear_neutral_samples_locked()
             self._collecting_neutral = True
             self._neutral_started_at = time.monotonic()
-            self._neutral_last_features = self._latest_features
+            self._neutral_last_features = None
             self._neutral_collection_error = None
-            self._message = "Collecting human neutral pose for 30 seconds"
-        LOGGER.info("human neutral-pose capture started | duration_s=30")
+            self._message = "中立姿势采集已开始，请让右肩、右肘和右手入镜。"
+        LOGGER.info("human neutral-pose capture started | duration_s=%s", NEUTRAL_CAPTURE_TIMEOUT_S)
         return {"ok": True, "message": self._message}
 
     def _arm(
@@ -3035,6 +3963,7 @@ class ControlEngine:
         expected = CONTROL_CONFIRMATION_CODE
         if confirmation != expected:
             raise ControlError(f"Confirmation must exactly match: {expected}")
+        stop_sequence = self._stop_sequence
         now = time.monotonic()
         with self._lock:
             if (
@@ -3067,6 +3996,24 @@ class ControlEngine:
                 raise ControlError("Pose has not been stable for enough consecutive frames.")
             if self._error is not None:
                 raise ControlError(f"A runtime fault must be resolved first: {self._error}")
+            # Connecting accepts a wider, mechanically valid startup pose. It
+            # must not authorize powered human following outside working limits.
+            measured = self._robot.read_positions()
+            limits = self.agent_joint_limits()
+            for joint in self.config.mapping.controlled_joints:
+                try:
+                    position = float(measured[joint])
+                except (KeyError, TypeError, ValueError, OverflowError) as exc:
+                    raise ControlError(f"{joint} 缺少有效位置反馈，无法启动人体跟随。") from exc
+                low, high = limits[joint]
+                if not math.isfinite(position) or not low <= position <= high:
+                    raise ControlError(f"{joint} 实测位置 {position:.2f} 不在动作范围 [{low:.2f}, {high:.2f}]，无法启动人体跟随。")
+            if not self._lease_valid_locked(client_id, time.monotonic()):
+                raise ControlError("The browser control lease expired while checking ARM positions.")
+            if self._stop_sequence != stop_sequence or submitted_epoch != self._epoch:
+                raise ControlError("ARM was cancelled by a STOP during position checking.")
+            self._range_current = dict(measured)
+            self._controller.reset_to(measured)
             self._motion_stop.clear()
             self._epoch += 1
             self._armed = True
@@ -3084,7 +4031,8 @@ class ControlEngine:
             ):
                 self._operator_client = None
                 self._epoch += 1
-                expired = self._armed or self._agent_plan is not None
+                expired = (self._armed or self._agent_plan is not None or self._companion_client is not None
+                           or self._gaze_client is not None)
                 # Do not cancel torque-free/manual calibration here. Browser prompt()
                 # blocks its own heartbeat timer, and the same local tab will
                 # reacquire the lease on its next API request. Powered following is
@@ -3099,6 +4047,7 @@ class ControlEngine:
 
     def _update_tracking(
         self, detection: PoseDetection, now: float, *, stop: threading.Event | None = None,
+        captured_at: float | None = None,
     ) -> PoseDetection:
         features = detection.features
         valid_features = frozenset(set(detection.valid_features) & set(CONTROL_FEATURES))
@@ -3115,14 +4064,8 @@ class ControlEngine:
                 and self._last_center_x is not None
             ):
                 if abs(features.center_x - self._last_center_x) > self.config.safety.max_person_center_jump:
-                    detection = PoseDetection(
-                        None,
-                        detection.landmarks,
-                        detection.people_count,
-                        "person changed",
-                        detection.hand_landmarks,
-                        detection.hand_label,
-                        frozenset(),
+                    detection = replace(
+                        detection, features=None, reason="person changed", valid_features=frozenset(),
                     )
                     features = None
                     valid_features = frozenset()
@@ -3140,6 +4083,7 @@ class ControlEngine:
                 self._valid_streak = 0
 
             self._detection = detection
+            self._companion_frame_at = captured_at
             self._latest_features = features
             self._latest_valid_features = valid_features
             self._visual_proximity = proximity
@@ -3263,6 +4207,7 @@ class ControlEngine:
                 if not all(math.isfinite(value) for value in actual.values()):
                     raise RuntimeError("Robot returned a non-finite sent-action value.")
             except Exception as exc:
+                LOGGER.exception("human follow servo command failed")
                 self.disarm("serial command failed")
                 with self._lock:
                     self._robot_state = "FAULT"
@@ -3371,7 +4316,12 @@ class ControlEngine:
                 epoch = self._agent_plan_epoch
                 previous = dict(self._last_action)
                 active_joints = tuple(frame.active_joints)
-                fixed = {joint: self._agent_hold_positions.get(joint, previous[joint]) for joint in ALL_JOINTS if joint not in active_joints}
+                limits = self.agent_joint_limits()
+                fixed = {
+                    joint: self._agent_hold_positions.get(joint, previous[joint])
+                    for joint in ALL_JOINTS if joint not in active_joints
+                    if limits[joint][0] <= self._agent_hold_positions.get(joint, previous[joint]) <= limits[joint][1]
+                }
                 if not set(active_joints) <= AGENT_JOINTS:
                     raise RuntimeError("Agent frame requested an unsupported joint.")
                 remaining_speech = self._agent_speech_remaining_locked(now)
@@ -3619,12 +4569,17 @@ class ControlEngine:
         import cv2
 
         with self._lock:
+            face_target = None
+            if self._companion_client is not None:
+                _, _, face_target = self._companion_view_locked(now)
             status_lines = [
                 f"WEB | {self._robot_state} | {'ARMED' if self._armed else 'DISARMED'}",
                 (
                     f"tracking: {detection.reason} | active: "
                     f"{','.join(sorted(set(detection.valid_features) & set(CONTROL_FEATURES))) or 'none'}"
                 ),
+                f"head: {'located' if head_target(detection) is not None else 'searching'} | "
+                f"source: {getattr(detection, 'head_source', None) or 'pose points'}",
                 (
                     "neutral: "
                     + ",".join(
@@ -3638,9 +4593,13 @@ class ControlEngine:
                     f"proximity: {self._visual_proximity.state} | agent: "
                     f"{self._agent_motion_state}"
                 ),
-                "ID1-2 FIXED | ID3-6 INDEPENDENT | physical power is the real E-stop",
+                (
+                    f"wrist companion: {self._companion_state} | physical power is the real E-stop"
+                    if self._companion_client is not None else
+                    "ID1-2 FIXED in human follow | physical power is the real E-stop"
+                ),
             ]
-        annotated = annotate_frame(frame, detection, status_lines)
+        annotated = annotate_frame(frame, detection, status_lines, face_target=face_target)
         ok, encoded = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
         if not ok:
             raise RuntimeError("JPEG encoding failed.")
@@ -3665,6 +4624,7 @@ class ControlEngine:
             detector = MediaPipePoseDetector(self.config.pose)
             while not stop.is_set():
                 ok, frame = camera.read()
+                captured_at = time.monotonic()
                 if stop.is_set():
                     break
                 if not ok:
@@ -3677,7 +4637,7 @@ class ControlEngine:
                 )
                 detection = detector.detect(frame)
                 now = time.monotonic()
-                detection = self._update_tracking(detection, now, stop=stop)
+                detection = self._update_tracking(detection, now, stop=stop, captured_at=captured_at)
                 if not stop.is_set():
                     self._publish_frame(frame, detection, now, stop)
         except Exception as exc:
@@ -3687,6 +4647,8 @@ class ControlEngine:
         finally:
             with self._send_lock, self._frame_condition:
                 self._preview_state = "STOPPING"
+                if self._companion_client is not None:
+                    self._disable_companion_locked("腕部相机已停止，陪伴模式已关闭。")
                 if self._armed:
                     self.disarm("视频已停止，人体跟随已解除。")
                 self._clear_camera_tracking_locked("camera stopped")
@@ -3727,6 +4689,8 @@ class ControlEngine:
                 self._poll_safe_range(now)
                 self._hold_agent_if_pending()
                 self._poll_teach(now)
+                self._poll_gaze_calibration(now)
+                self._poll_companion(now)
                 with self._lock:
                     features = self._latest_features
                     valid_features = self._latest_valid_features

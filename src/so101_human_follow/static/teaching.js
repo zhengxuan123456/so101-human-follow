@@ -27,6 +27,15 @@
     const stop = byId("teachStopRecording");
     const extract = byId("teachExtractRecording");
     const recordStatus = byId("teachRecordingStatus");
+    const errorDetails = document.createElement("details");
+    const errorSummary = document.createElement("summary");
+    const errorRaw = document.createElement("p");
+    errorDetails.id = "teachLeaderErrorDetails";
+    errorDetails.hidden = true;
+    errorSummary.textContent = "查看原始错误详情";
+    errorRaw.className = "simulation-note";
+    errorDetails.append(errorSummary, errorRaw);
+    leaderStatus.insertAdjacentElement("afterend", errorDetails);
     const leaderCommands = [...document.querySelectorAll("[data-teach-command]")];
     const followerCommands = [...document.querySelectorAll("[data-follower-command]")];
     const directions = new Map();
@@ -41,6 +50,10 @@
     let opened = false;
     let timer = null;
     let revision = 0;
+    let statusRequest = null;
+    let closeRequiresStatus = false;
+    const buttonLabels = new Map(leaderCommands.map(button => [button, button.textContent]));
+    const syncingMessage = "正在重新同步主臂状态，请稍候。";
 
     for (const [index, [joint, label]] of joints.entries()) {
       const caption = `ID${index + 1} ${label}`;
@@ -64,6 +77,30 @@
     function rangeLabel(range, digits = 2) {
       if (!Array.isArray(range) || range.length !== 2 || !range.every(Number.isFinite)) return "—";
       return range.map(value => value.toFixed(digits)).join(" ～ ");
+    }
+
+    function missingMotorMessage(error) {
+      const text = String(error || "");
+      const missing = text.match(/Missing motor IDs:\s*([\s\S]*?)(?:Full expected motor list|Full found motor list|$)/i);
+      if (!missing) return "";
+      const ids = [...missing[1].matchAll(/-\s*(\d+)\b/g)].map(match => Number(match[1]));
+      if (!ids.length) return "";
+      const port = text.match(/port\s+['"]([^'"]+)['"]/i)?.[1] || leaderPort.value.trim();
+      if (port.toUpperCase() !== leaderPort.value.trim().toUpperCase()) return "";
+      const motors = ids.map(id => `ID${id}${joints[id - 1] ? `（${joints[id - 1][1]}）` : ""}`).join("、");
+      return `主臂 ${port} 未检测到 ${motors}，本次校准未开始。`;
+    }
+
+    function busyMessage() {
+      return {
+        "calibration/start": `正在连接主臂 ${leaderPort.value.trim()}，检查六轴舵机…`,
+        "calibration/middle": "正在确定主臂六轴中位…",
+        "calibration/range": "正在开始采集主臂六轴范围…",
+        "calibration/save": "正在保存主臂校准…",
+        "calibration/cancel": "正在取消主臂校准…",
+        "recording/start": `正在连接主臂 ${leaderPort.value.trim()}，准备录制…`,
+        "recording/stop": "正在结束主臂录制…",
+      }[pending] || "";
     }
 
     function render() {
@@ -104,12 +141,17 @@
         "calibration/middle": leaderStage === "WAITING_MIDDLE",
         "calibration/range": leaderStage === "MIDDLE_CAPTURED",
         "calibration/save": leaderStage === "CALIBRATING_RANGE",
-        "calibration/cancel": calibrating,
+        "calibration/cancel": calibrating || closeRequiresStatus,
       };
       for (const button of leaderCommands) {
         const command = button.dataset.teachCommand;
         const allowed = command === "calibration/cancel" ? canControl : canStart;
         button.disabled = !allowed || busy || !allowedStages[command];
+        button.textContent = pending === command
+          ? ({ "calibration/start": "正在连接…", "calibration/middle": "正在确定…",
+            "calibration/range": "正在开始采集…", "calibration/save": "正在保存…",
+            "calibration/cancel": "正在取消…" }[command] || buttonLabels.get(button))
+          : buttonLabels.get(button);
       }
       const followerFlags = {
         connect: shared?.can_connect && Boolean(otherPort),
@@ -121,7 +163,8 @@
       };
       for (const button of followerCommands) {
         const command = button.dataset.followerCommand;
-        button.disabled = !canStart || busy || active || !followerFlags[command];
+        const allowed = command === "calibration/cancel" ? canControl : canStart;
+        button.disabled = !allowed || busy || active || !followerFlags[command];
         if (command === "connect") button.textContent = connected ? "从臂已连接" : "连接从臂";
       }
       const hasMetadata = Boolean(name.value.trim() && description.value.trim());
@@ -139,13 +182,18 @@
         CALIBRATING_RANGE: `正在采集六轴范围 · 剩余 ${Math.ceil(state?.calibration_remaining_s ?? 0)} 秒。逐轴移动完成后可以提前保存。`,
         CALIBRATED: "主臂校准已保存。",
       };
-      leaderStatus.textContent = leaderMessages[leaderStage] || "";
+      const rawError = lastError || state?.error || "";
+      const friendlyError = missingMotorMessage(rawError);
+      leaderStatus.textContent = busyMessage() || [friendlyError, statusError].filter(Boolean).join(" ") || leaderMessages[leaderStage] || "";
+      leaderStatus.classList.toggle("is-error", Boolean(!busy && friendlyError));
+      errorDetails.hidden = !rawError;
+      errorRaw.textContent = rawError;
       followerStatus.textContent = connected ? `已连接 · ${state?.follower_port || otherPort}`
         : state?.robot_allowed === false ? "当前服务未启用真机串口控制。" : "等待连接从臂。";
       followerCalibrationStatus.textContent = byId("baseCalibrationProgressText").textContent;
 
       const seconds = Number(state?.duration_s || 0).toFixed(1);
-      const error = lastError || statusError || state?.error;
+      const error = friendlyError || lastError || statusError || state?.error;
       recordStatus.classList.toggle("is-error", Boolean(error));
       let note = "填入主臂串口、动作名称和介绍，选择录制模式。";
       if (recordingNow) {
@@ -160,7 +208,7 @@
       } else if (sync && !connected) {
         note = "同步跟随前请连接已校准的从臂。";
       }
-      recordStatus.textContent = error || note;
+      recordStatus.textContent = busyMessage() || error || note;
       const observed = recordingNow ? state.ranges : getObservedLimits();
       const visibleCalibration = calibrationPort.toUpperCase() === mainPort.toUpperCase();
       const leaderRanges = visibleCalibration && (active || leaderStage === "CALIBRATED")
@@ -185,36 +233,52 @@
     async function refresh(whilePending = false) {
       if (!opened || (pending && !whilePending)) return;
       const before = revision;
+      if (statusRequest?.revision === before) return;
+      const request = { revision: before };
+      statusRequest = request;
       try {
         const status = await api("/api/teach/status");
         if (before === revision && opened) {
           state = status;
           statusError = "";
+          closeRequiresStatus = false;
         }
       } catch (error) {
         if (error.name !== "AbortError" && before === revision && opened) {
           statusError = error.message;
         }
+      } finally {
+        if (statusRequest === request) statusRequest = null;
       }
       if (opened) render();
     }
 
     async function run(operation, command) {
-      if (pending) return false;
+      const recovery = ["calibration/cancel", "follower/calibration/cancel", "recording/stop"].includes(operation);
+      if (pending || (statusError && !recovery)) return false;
       pending = operation;
       ++revision;
       lastError = "";
       render();
       try {
         await command();
+        closeRequiresStatus = operation !== "draft" && operation !== "calibration/cancel";
+        if (operation === "calibration/cancel" && state) {
+          // This POST explicitly confirms cancellation even if the next GET fails.
+          state = { ...state, state: "IDLE", active: false, recording: false, sync_active: false, error: null };
+        }
         return true;
       } catch (error) {
         if (error.name !== "AbortError") lastError = error.message;
+        // A missing-motor handshake rejection happens before a session starts.
+        // Other failures may leave a real session running until status confirms it.
+        closeRequiresStatus = operation !== "draft" && !missingMotorMessage(error.message);
         return false;
       } finally {
-        await refresh(true);
+        statusError = syncingMessage;
         pending = null;
         render();
+        await refresh();
       }
     }
 
@@ -269,7 +333,7 @@
       });
     }
     for (const button of followerCommands) {
-      button.addEventListener("click", () => void run(button.dataset.followerCommand, async () => {
+      button.addEventListener("click", () => void run(`follower/${button.dataset.followerCommand}`, async () => {
         const error = await follower.run(button.dataset.followerCommand);
         if (error) throw new Error(error);
       }));
@@ -298,7 +362,7 @@
       start() {
         opened = true;
         lastError = "";
-        statusError = "";
+        statusError = syncingMessage;
         confirmed.checked = false;
         render();
         void refresh();
@@ -311,6 +375,7 @@
           }
           return !pending;
         }
+        if (closeRequiresStatus && statusError) return false;
         if (state?.recording) return stopRecording();
         if (state?.active) return command("calibration/cancel");
         return true;

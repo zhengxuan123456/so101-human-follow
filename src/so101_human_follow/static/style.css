@@ -594,6 +594,24 @@ h2 {
   font-size: 0.65rem;
 }
 
+.companion-gaze-calibration {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+  background: var(--input-bg);
+}
+
+.companion-gaze-calibration .progress-track {
+  margin-top: 0;
+}
+
+.companion-gaze-calibration [hidden] {
+  display: none;
+}
+
 .stop-button {
   display: flex;
   align-items: center;

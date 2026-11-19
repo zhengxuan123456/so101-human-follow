@@ -37,7 +37,14 @@ class SafeRangeProfile:
         controlled_limits: Mapping[str, tuple[float, float]],
         fixed_positions: Mapping[str, float],
         startup_positions: Mapping[str, float],
+        require_startup_middle: bool = True,
     ) -> "SafeRangeProfile":
+        """Create a profile, keeping captured-profile midpoint checks by default.
+
+        A configured, in-memory envelope may instead retain the measured
+        connection pose. Its caller must still perform the startup safety checks.
+        Saving or loading a captured profile always uses strict validation.
+        """
         profile = cls(
             robot_id=str(robot_id),
             calibration_fingerprint=str(calibration_fingerprint),
@@ -51,7 +58,7 @@ class SafeRangeProfile:
             },
             created_at=datetime.now(timezone.utc).isoformat(),
         )
-        profile.validate()
+        profile.validate(require_startup_middle=require_startup_middle)
         return profile
 
     @classmethod
@@ -79,7 +86,9 @@ class SafeRangeProfile:
         profile.validate()
         return profile
 
-    def validate(self) -> None:
+    def validate(self, *, require_startup_middle: bool = True) -> None:
+        if type(require_startup_middle) is not bool:
+            raise ValueError("require_startup_middle must be a boolean.")
         if not self.robot_id or not self.calibration_fingerprint:
             raise ValueError("Safe-range profile must identify the robot calibration.")
         if set(self.controlled_limits) != set(CONTROLLED_JOINTS):
@@ -100,7 +109,9 @@ class SafeRangeProfile:
                     f"Safe range for {joint} is too small; move it through at least "
                     f"{MIN_CONTROLLED_SPAN:.1f} position units."
                 )
-            if not low + MIDPOINT_EDGE_MARGIN < startup < high - MIDPOINT_EDGE_MARGIN:
+            if require_startup_middle and not (
+                low + MIDPOINT_EDGE_MARGIN < startup < high - MIDPOINT_EDGE_MARGIN
+            ):
                 raise ValueError(
                     f"Return {joint} to a comfortable middle position before saving."
                 )

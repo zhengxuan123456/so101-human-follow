@@ -703,6 +703,8 @@ class SimulationService:
             if jid < 0 or aid < 0:
                 raise ValueError(f"仿真模型缺少关节或执行器：{name}")
             self._indices[joint] = (int(model.jnt_qposadr[jid]), aid, tuple(model.jnt_range[jid]))
+            if name == "wrist_roll":
+                self._wrist_camera_body = int(model.jnt_bodyid[jid])
         model.vis.global_.offwidth = max(720, model.vis.global_.offwidth)
         model.vis.global_.offheight = max(540, model.vis.global_.offheight)
         self._data = mujoco.MjData(model)
@@ -915,7 +917,19 @@ class SimulationService:
         elif command == "frame":
             if self._renderer is None:
                 self._renderer = self._mj.Renderer(self._model, height=540, width=720)
-            self._renderer.update_scene(self._data, camera=self._camera)
+            wrist_view = payload == "wrist"
+            self._renderer.update_scene(self._data, camera=-1 if wrist_view else self._camera)
+            if wrist_view:
+                # SO-101 gripper model local +X is up and -Z points past the jaws.
+                # The virtual lens is offset above the gripper without hardware calibration.
+                body = self._wrist_camera_body
+                rotation = self._data.xmat[body].reshape(3, 3)
+                up, forward = rotation[:, 0], -rotation[:, 2]
+                position = self._data.xpos[body] + 0.09 * up + 0.055 * forward
+                for camera in self._renderer.scene.camera:
+                    camera.pos[:] = position
+                    camera.forward[:] = forward
+                    camera.up[:] = up
             rgb = self._renderer.render()
             import cv2
             ok, encoded = cv2.imencode(".jpg", cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_JPEG_QUALITY, 85])
@@ -1016,6 +1030,10 @@ def create_simulation_blueprint(
         try:
             if command == "pose":
                 payload = (payload or {}).get("targets")
+            elif command == "frame":
+                payload = request.args.get("view", "external")
+                if payload not in {"external", "wrist"}:
+                    raise ValueError("仿真视角请选择外部或腕部视角。")
             elif command == "play_recording" and "recording_id" in payload:
                 saved = library.get_recording(payload["recording_id"])
                 payload = {"recording": saved["recording"], "track": payload.get("track", "leader")}

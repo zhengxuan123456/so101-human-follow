@@ -36,6 +36,7 @@ class CameraSettings:
     rotation_degrees: float
     flip_horizontal: bool
     flip_vertical: bool
+    wrist_name: str = "icspring camera"
 
 
 @dataclass(frozen=True)
@@ -52,6 +53,10 @@ class PoseSettings:
     hand_min_tracking_confidence: float
     max_hand_wrist_distance: float
     neutral_sample_count: int
+    face_model_path: Path | None = None
+    face_verifier_model_path: Path | None = None
+    face_verifier_score_threshold: float = 0.5
+    face_verifier_min_iou: float = 0.3
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,17 @@ def load_config(path: str | Path) -> AppConfig:
     hand_model_path = Path(pose_raw["hand_model_path"]).expanduser()
     if not hand_model_path.is_absolute():
         hand_model_path = (config_path.parent / hand_model_path).resolve()
+    face_model_raw = pose_raw.get("face_model_path")
+    face_model_path = (
+        model_path.with_name("blaze_face_short_range.tflite")
+        if face_model_raw is None else Path(face_model_raw).expanduser()
+    )
+    if not face_model_path.is_absolute():
+        face_model_path = (config_path.parent / face_model_path).resolve()
+    verifier_raw = pose_raw.get("face_verifier_model_path")
+    verifier_path = None if verifier_raw is None else Path(verifier_raw).expanduser()
+    if verifier_path is not None and not verifier_path.is_absolute():
+        verifier_path = (config_path.parent / verifier_path).resolve()
 
     config = AppConfig(
         camera=CameraSettings(
@@ -147,6 +163,7 @@ def load_config(path: str | Path) -> AppConfig:
             rotation_degrees=float(camera_raw.get("rotation_degrees", 0.0)),
             flip_horizontal=bool(camera_raw.get("flip_horizontal", False)),
             flip_vertical=bool(camera_raw.get("flip_vertical", False)),
+            wrist_name=str(camera_raw.get("wrist_name", "icspring camera")).strip(),
         ),
         pose=PoseSettings(
             model_path=model_path,
@@ -161,6 +178,10 @@ def load_config(path: str | Path) -> AppConfig:
             hand_min_tracking_confidence=float(pose_raw["hand_min_tracking_confidence"]),
             max_hand_wrist_distance=float(pose_raw["max_hand_wrist_distance"]),
             neutral_sample_count=int(pose_raw["neutral_sample_count"]),
+            face_model_path=face_model_path,
+            face_verifier_model_path=verifier_path,
+            face_verifier_score_threshold=float(pose_raw.get("face_verifier_score_threshold", 0.5)),
+            face_verifier_min_iou=float(pose_raw.get("face_verifier_min_iou", 0.3)),
         ),
         robot=RobotSettings(
             port=str(robot_raw["port"]),
@@ -239,6 +260,8 @@ def validate_config(config: AppConfig) -> None:
 
     if config.pose.side not in {"left", "right"}:
         raise ValueError("pose.side must be 'left' or 'right'.")
+    if not config.camera.wrist_name or len(config.camera.wrist_name) > 160:
+        raise ValueError("camera.wrist_name must be a valid camera device name.")
     if config.camera.width <= 0 or config.camera.height <= 0 or config.camera.fps <= 0:
         raise ValueError("Camera width, height and fps must be positive.")
     if not math.isfinite(config.camera.rotation_degrees):
@@ -254,6 +277,8 @@ def validate_config(config: AppConfig) -> None:
         ("hand_min_detection_confidence", config.pose.hand_min_detection_confidence),
         ("hand_min_presence_confidence", config.pose.hand_min_presence_confidence),
         ("hand_min_tracking_confidence", config.pose.hand_min_tracking_confidence),
+        ("face_verifier_score_threshold", config.pose.face_verifier_score_threshold),
+        ("face_verifier_min_iou", config.pose.face_verifier_min_iou),
     ):
         if not 0.0 < value <= 1.0:
             raise ValueError(f"{name} must be in (0, 1].")

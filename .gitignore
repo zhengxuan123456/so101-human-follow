@@ -9,6 +9,8 @@ outputs/
 action_library/
 logs/
 safety_profile.json
+gaze_calibration.json
+.gaze-*.tmp
 .safety_profile.json.*.tmp
 config.json
 agent_preferences.json
@@ -20,4 +22,5 @@ agent_memory.json.*
 .env
 .git/
 .git-init-partial-backup/
+.codex-*
 

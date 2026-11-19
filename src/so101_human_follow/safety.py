@@ -40,6 +40,17 @@ def slew_limit(previous: float, target: float, max_step: float) -> float:
     return previous + clamp(target - previous, -max_step, max_step)
 
 
+def gripper_position_for_hand(
+    hand_open: float, limits: tuple[float, float], *, open_is_high: bool,
+) -> float:
+    """Map a fist or extended palm to the full permitted ID6 travel."""
+    openness = clamp((hand_open - 0.35) / 0.20, 0.0, 1.0)
+    if not open_is_high:
+        openness = 1.0 - openness
+    low, high = limits
+    return low + openness * (high - low)
+
+
 @dataclass
 class MotionController:
     initial: dict[str, float]
@@ -146,18 +157,11 @@ class MotionController:
                 continue
             absolute_low, absolute_high = self.safety.absolute_limits[joint]
             if joint == "gripper.pos":
-                # A neutral-centred delta only moved the gripper a few units.
-                # Expand the useful camera openness band to the complete physical
-                # 0..100 gripper envelope so a fist and an open palm are visibly
-                # different.  The configured sign still allows reversal.
-                # Deliberately use a steep gesture band: <=0.35 is a full close
-                # target and >=0.55 is a full open target.  The small transition
-                # band converts a visibly large fist/open gesture into the complete
-                # ID6 stroke instead of a small mid-range wobble.
-                openness = clamp((float(features.hand_open) - 0.35) / 0.20, 0.0, 1.0)
-                if self.mapping.signs[joint] < 0.0:
-                    openness = 1.0 - openness
-                raw = absolute_low + openness * (absolute_high - absolute_low)
+                raw = gripper_position_for_hand(
+                    float(features.hand_open),
+                    (absolute_low, absolute_high),
+                    open_is_high=self.mapping.signs[joint] >= 0.0,
+                )
             else:
                 feature_delta = getattr(features, feature_name) - getattr(neutral, feature_name)
                 if feature_name == "hand_roll":

@@ -21,11 +21,14 @@
     closeVideoFollowButton: byId("closeVideoFollowButton"),
     videoFollowDialog: byId("videoFollowDialog"),
     videoFollowSteps: byId("videoFollowSteps"),
-    videoStopSlot: byId("videoStopSlot"),
     videoDialogStopButton: byId("videoDialogStopButton"),
     openAgentChatButton: byId("openAgentChatButton"),
     closeAgentChatButton: byId("closeAgentChatButton"),
     agentChatDialog: byId("agentChatDialog"),
+    companionWorkspaceDialog: byId("companionWorkspaceDialog"),
+    companionAgentSlot: byId("companionAgentSlot"),
+    homeAgentSlot: byId("homeAgentSlot"),
+    agentPanel: byId("agentPanel"),
     pinkThemeButton: byId("pinkThemeButton"),
     whiteThemeButton: byId("whiteThemeButton"),
     openAgentSettingsButton: byId("openAgentSettingsButton"),
@@ -482,7 +485,7 @@
     const cleaned = String(text || "").trim()
       .replace(new RegExp(`^${escapeRegExp(agentName)}[，,\\s]*`, "i"), "");
     const chinese = cleaned.replace(/[，。！？!?,.\s]/g, "");
-    return /^(停止|停下|别动|不要动|马上停止|紧急停止|急停)$/.test(chinese) ||
+    return /^(停止|停止跟随|停止陪伴|停下|别动|不要动|马上停止|紧急停止|急停)$/.test(chinese) ||
       /^(?:please\s+)?(?:emergency\s+stop|stop(?:\s+moving)?|halt|freeze|(?:do\s+not|don['’]t)\s+move)(?:\s+now)?(?:[,\s]+please)?[.!?]*$/i.test(cleaned);
   }
 
@@ -491,6 +494,7 @@
   }
 
   async function executeLocalStop(sourceText) {
+    window.so101FollowerControl?.cancelPendingStarts();
     invalidateInteraction();
     const generation = interactionGeneration;
     agentBusy = true;
@@ -1304,6 +1308,7 @@
       if (voiceEnabled && !speaking && !agentBusy && !renderMotionStatus()) setAgentState("listening");
     };
     instance.onresult = (event) => {
+      if (!voiceEnabled) return;
       const interimParts = [];
       const finalParts = [];
       for (let index = event.resultIndex; index < event.results.length; index += 1) {
@@ -1412,7 +1417,7 @@
       small.textContent = "持续监听并支持插话，使用耳机会更稳定";
     } else {
       strong.textContent = "开始语音 Agent";
-      small.textContent = "开启后持续监听，直到手动关闭";
+      small.textContent = "可说“点头两次”“打开夹爪”或“停止”";
       elements.voiceToggleButton.classList.remove("is-listening");
     }
   }
@@ -1488,6 +1493,18 @@
         if (event.target === dialog) dialog.close();
       });
     }
+    for (const dialog of [elements.agentChatDialog, elements.companionWorkspaceDialog]) {
+      dialog.addEventListener("close", () => {
+        if (elements.agentChatDialog.open || elements.companionWorkspaceDialog.open) return;
+        if (voiceEnabled) toggleVoice();
+        elements.homeAgentSlot.append(elements.agentPanel);
+      });
+    }
+    elements.companionWorkspaceDialog.addEventListener("so101:companion-open", () => {
+      if (elements.agentChatDialog.open) elements.agentChatDialog.close();
+      elements.companionAgentSlot.append(elements.agentPanel);
+      elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
+    });
     elements.pinkThemeButton.addEventListener("click", () => setTheme("pink"));
     elements.whiteThemeButton.addEventListener("click", () => setTheme("white"));
     elements.openAgentSettingsButton.addEventListener("click", openSettings);
@@ -1535,10 +1552,14 @@
   }
 
   function openModeDialog(dialog) {
-    for (const other of [elements.videoFollowDialog, elements.agentChatDialog]) {
+    for (const other of [elements.videoFollowDialog, elements.agentChatDialog, elements.companionWorkspaceDialog]) {
       if (other !== dialog && other.open) other.close();
     }
-    if (!dialog.open) dialog.showModal();
+    if (dialog.open) return;
+    if (dialog === elements.agentChatDialog) elements.homeAgentSlot.append(elements.agentPanel);
+    dialog.showModal();
+    if (dialog === elements.videoFollowDialog) dialog.dispatchEvent(new Event("so101:video-open"));
+    elements.chatMessages.scrollTop = elements.chatMessages.scrollHeight;
   }
 
   function mountModeControls() {

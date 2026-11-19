@@ -1,6 +1,7 @@
 {
   "camera": {
     "index": 0,
+    "wrist_name": "icspring camera",
     "width": 640,
     "height": 480,
     "fps": 30,
@@ -11,6 +12,7 @@
   "pose": {
     "model_path": "models/pose_landmarker_lite.task",
     "hand_model_path": "models/hand_landmarker.task",
+    "face_model_path": "models/blaze_face_short_range.tflite",
     "side": "right",
     "min_detection_confidence": 0.5,
     "min_presence_confidence": 0.5,
