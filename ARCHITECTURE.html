@@ -22,15 +22,24 @@ pre{margin:16px 0 20px;overflow:auto;padding:16px 18px;border-radius:8px;backgro
 <body id="top">
 <header class="top">
 <div class="top-inner">
-<div><p class="meta">版本 1.2.0 · 2026 年 11 月 14 日</p><h1>SO-101 项目架构与源码指南</h1></div>
+<div><p class="meta">版本 1.3.0 · 2026 年 11 月 19 日</p><h1>SO-101 项目架构与源码指南</h1></div>
 <div class="top-actions"><a href="ARCHITECTURE.md">Markdown 源文档</a><button hidden="" id="print" type="button">打印／存为 PDF</button></div>
 </div>
 </header>
 <div class="layout">
-<aside class="toc"><details open=""><summary>文档目录</summary><nav aria-label="章节"><a href="#1">1. 当前项目能做什么</a><a href="#2">2. 技术栈与运行入口</a><a href="#3">3. 整体结构与控制权</a><a href="#4">4. 模块与关键方法索引</a><a href="#5">5. 视觉跟随、校准与六舵机映射</a><a href="#6-agent">6. Agent、语音、记忆与插话</a><a href="#7-mujoco">7. 示教、动作文件与 MuJoCo</a><a href="#8">8. 从需求定位到代码</a><a href="#9">9. 工程文件、测试与故障排查</a><a href="#10">10. 下一步开发优先级与参考项目</a></nav></details></aside>
+<aside class="toc"><details open=""><summary>文档目录</summary><nav aria-label="章节"><a href="#v13">版本 1.3 新增路径</a><a href="#1">1. 当前项目能做什么</a><a href="#2">2. 技术栈与运行入口</a><a href="#3">3. 整体结构与控制权</a><a href="#4">4. 模块与关键方法索引</a><a href="#5">5. 视觉跟随、校准与六舵机映射</a><a href="#6-agent">6. Agent、语音、记忆与插话</a><a href="#7-mujoco">7. 示教、动作文件与 MuJoCo</a><a href="#8">8. 从需求定位到代码</a><a href="#9">9. 工程文件、测试与故障排查</a><a href="#10">10. 下一步开发优先级与参考项目</a></nav></details></aside>
 <main class="article">
 
-<p>本文介绍 1.2 版的日志、连续回放、本地指令、组合动作和返回连接姿势。部署和入门命令见 <a href="README.md">README</a>。</p>
+<p>本文介绍 1.3 版的腕部相机注视、陪伴动作和示教状态恢复，并保留已有的日志、连续回放、本地指令、组合动作和返回连接姿势说明。部署和入门命令见 <a href="README.md">README</a>。</p>
+<h2 id="v13">版本 1.3 新增路径</h2>
+<ol>
+<li><strong>人脸目标。</strong> 腕部相机画面中的 BlazeFace 候选经 OpenCV YuNet 复核和连续帧确认后，作为注视标定目标；可靠的人体头部关键点可供运行期回退，标定只接受经过复核的独立人脸。见 <a href="src/so101_human_follow/pose_detector.py">pose_detector.py</a>。</li>
+<li><strong>方向标定与闭环。</strong> 显式点击后先倒计时，再等待设备和稳定人脸。底座、腕部分别做小幅探测，以编码器到位后的新图像测得二维响应矩阵；<code>ImageGazeController</code> 根据实测关系纠偏，保留死区、限速、限位、陈旧帧及发散检查。见 <a href="src/so101_human_follow/gaze_controller.py">gaze_controller.py</a>。</li>
+<li><strong>陪伴运动与控制权。</strong> <code>CompanionMotion</code> 叠加肩肘周期动作和腕部补偿，人脸靠近画面边缘时减小身体动作。视觉计算与串口控制分开，实际读写仍由同一个控制线程串行执行。语音监听、普通聊天可继续；真正的 Agent 机械动作暂时接管，结束后从实测位置恢复陪伴。见 <a href="src/so101_human_follow/companion.py">companion.py</a> 与 <a href="src/so101_human_follow/web_engine.py">web_engine.py</a>。</li>
+<li><strong>原始反馈与存储。</strong> 探测和陪伴核对同批 raw／归一化位置；底座或腕部 raw 超出舵机校准记录时停止，不把被截断的 <code>-100/100</code> 当成有效端点继续运动。注视结果由 <code>gaze_storage.py</code> 保存到用户数据目录，绑定相机、机器人校准指纹和限位；启动只加载匹配结果，不自动启动运动。见 <a href="src/so101_human_follow/robot_adapter.py">robot_adapter.py</a> 与 <a href="src/so101_human_follow/gaze_storage.py">gaze_storage.py</a>。</li>
+<li><strong>前端恢复。</strong> 首页提供视频跟随、对话、仿真与动作编辑、陪伴四个入口，陪伴界面可连接设备并对话。示教请求有即时连接反馈和简短舵机错误；只读状态 GET（含响应正文）最多等待 5 秒，POST 完成后先清理等待状态再同步，状态未知时保留同步门及显式取消入口。机械操作 POST 不自动重发，网络中止不代表硬件命令已停止。见 <a href="src/so101_human_follow/static/teaching.js">static/teaching.js</a> 与 <a href="src/so101_human_follow/static/simulation.js">static/simulation.js</a>。</li>
+</ol>
+<p>这些改动提供检测、拒绝和恢复机制，不代表修复了舵机掉线或底层零点偏移溢出；真实行程、安装方向、供电与线缆仍须按设备核查。</p>
 <h2 id="1">1. 当前项目能做什么</h2>
 <div aria-label="表格，可横向滚动" class="table-scroll" role="region" tabindex="0"><table>
 <thead>
@@ -50,6 +59,11 @@ pre{margin:16px 0 20px;overflow:auto;padding:16px 18px;border-radius:8px;backgro
 <td>文字／语音 Agent</td>
 <td>输入或说出「打开夹爪」「点头两次」「摸摸头」，也可以发一句有先后顺序的指令</td>
 <td>固定明确指令可在本地规划，开放式对话、语义选用自定义动作和部分补充式插话走配置的云模型。真机动作需要从臂连接及安全范围</td>
+</tr>
+<tr>
+<td>腕部相机陪伴</td>
+<td>在陪伴界面连接从臂和腕部相机，完成注视方向标定后开启，边做肩肘动作边纠偏</td>
+<td>使用经确认的头部目标、实测局部响应及舵机反馈；丢帧、发散或原始读数越过校准记录时保持／拒绝运动，搜索需显式允许</td>
 </tr>
 <tr>
 <td>返回连接姿势</td>
@@ -88,7 +102,7 @@ pre{margin:16px 0 20px;overflow:auto;padding:16px 18px;border-radius:8px;backgro
 </tr>
 </tbody>
 </table></div>
-<p><strong>验证状态。</strong> 历史实机记录确认过视频跟随的 ID3 和 ID6。此次 P0–P3 已用模拟舵机验证录制、JSON 保存、起点过渡、连续回放、停止和偏差拦截，组合动作也经过 Flask 接口和 MuJoCo 预览验证。真实动作方向、供电负载下的连贯度、夹爪开合效果和语音起播延迟需要在实际设备上测量。</p>
+<p><strong>验证状态。</strong> 1.3 发布检查通过 256 项 Python 单元测试、12 项 Node 离线测试及 4 个前端脚本语法检查。历史实机记录确认过视频跟随的 ID3 和 ID6；录制、回放、注视闭环、raw 越界拦截与示教恢复使用模拟反馈或离线页面桩验证。真实动作方向、供电负载下的连贯度、夹爪开合效果、相机跟踪与语音起播延迟仍需在实际设备上测量。</p>
 <h2 id="2">2. 技术栈与运行入口</h2>
 <div aria-label="表格，可横向滚动" class="table-scroll" role="region" tabindex="0"><table>
 <thead>
@@ -116,8 +130,8 @@ pre{margin:16px 0 20px;overflow:auto;padding:16px 18px;border-radius:8px;backgro
 </tr>
 <tr>
 <td>相机与视觉</td>
-<td>Windows DirectShow、OpenCV、MediaPipe Tasks、NumPy</td>
-<td>枚举并按名称连接相机，采集、旋转和标注画面，提取人体及手部关键点</td>
+<td>Windows DirectShow、OpenCV、MediaPipe Tasks、BlazeFace、YuNet、NumPy</td>
+<td>枚举并按名称连接相机，采集、旋转和标注画面，提取人体／手部关键点，复核独立人脸并提供注视目标</td>
 </tr>
 <tr>
 <td>总线</td>
@@ -159,7 +173,8 @@ pre{margin:16px 0 20px;overflow:auto;padding:16px 18px;border-radius:8px;backgro
   ├─ simulation.js ─── 仿真／编排／真机试运行 ─── Flask → ActionLibrary
   └─ teaching.js ───── 主从臂设置／录制 ───────── Flask     │
                                                            ▼
-相机线程 → MediaPipe → 特征及预览 ──────────────── ControlEngine
+相机线程 → MediaPipe／YuNet → 特征及预览 ──────── ControlEngine
+头部目标 → 注视闭环／CompanionMotion ──────────────┤
 AgentService → 已校验语义计划 → 适配成控制命令 ───────┤
 ActionLibrary → 关键帧或从臂轨迹 → 适配成控制命令 ─────┤
 TeachRecorder → 主臂读数 ──────────────────────────┤
@@ -201,9 +216,24 @@ TeachRecorder → 主臂读数 ────────────────�
 <td>Windows DirectShow 枚举设备名称，返回 OpenCV 可使用的设备索引</td>
 </tr>
 <tr>
-<td><a href="src/so101_human_follow/pose_detector.py#L91">pose_detector.py</a></td>
-<td><code>MediaPipePoseDetector.detect</code>、<code>_select_hand</code>、<code>orient_camera_frame</code>、<code>annotate_frame</code></td>
-<td>从画面生成 <code>PoseDetection</code>，关联手部与目标腕部，并绘制预览</td>
+<td><a href="src/so101_human_follow/pose_detector.py">pose_detector.py</a></td>
+<td><code>MediaPipePoseDetector.detect</code>、<code>_VerifiedHeadTracker</code>、<code>_YuNetFaceVerifier</code>、<code>annotate_frame</code></td>
+<td>从画面生成 <code>PoseDetection</code>，关联手部与目标腕部，复核人脸和目标连续性，并绘制预览</td>
+</tr>
+<tr>
+<td><a href="src/so101_human_follow/gaze_controller.py">gaze_controller.py</a></td>
+<td><code>GazeCalibrator</code>、<code>GazeCalibration</code>、<code>ImageGazeController.update</code></td>
+<td>小幅两轴探测、实测响应矩阵与阻尼图像纠偏；纯数学计算，不直接操作硬件</td>
+</tr>
+<tr>
+<td><a href="src/so101_human_follow/gaze_storage.py">gaze_storage.py</a></td>
+<td><code>gaze_state_path</code>、<code>atomic_write_gaze</code>、<code>read_gaze</code></td>
+<td>按项目命名空间保存与校验用户数据目录中的注视标定结果</td>
+</tr>
+<tr>
+<td><a href="src/so101_human_follow/companion.py">companion.py</a></td>
+<td><code>CompanionMotion.step</code>、<code>resume_from</code>、<code>head_target</code></td>
+<td>生成相对当前姿态的陪伴目标，叠加肩肘表达、腕部补偿、注视纠偏和可靠手势的夹爪目标</td>
 </tr>
 <tr>
 <td><a href="src/so101_human_follow/pose_math.py#L185">pose_math.py</a></td>
@@ -221,9 +251,9 @@ TeachRecorder → 主臂读数 ────────────────�
 <td>管理固定位置、视觉工作范围、机器人 ID 与校准指纹</td>
 </tr>
 <tr>
-<td><a href="src/so101_human_follow/robot_adapter.py#L31">robot_adapter.py</a></td>
-<td><code>SO101RobotAdapter.connect</code>、<code>read_positions</code>、<code>send_agent_targets</code>、<code>hold_current</code>、<code>SO101CalibrationSession</code></td>
-<td>对接 Feetech 和 LeRobot。返回实测、实发位置，处理校准核对、同步写入和扭矩</td>
+<td><a href="src/so101_human_follow/robot_adapter.py">robot_adapter.py</a></td>
+<td><code>SO101RobotAdapter.connect</code>、<code>read_calibration_observation</code>、<code>send_agent_targets</code>、<code>hold_raw_current</code>、<code>SO101CalibrationSession</code></td>
+<td>对接 Feetech 和 LeRobot。核对校准、同批 raw／归一化反馈、实测与实发位置，处理同步写入和扭矩</td>
 </tr>
 <tr>
 <td><a href="src/so101_human_follow/speech_normalizer.py#L81">speech_normalizer.py</a></td>
@@ -613,6 +643,10 @@ TeachRecorder → 主臂读数 ────────────────�
 <td>前者保存采集的工作范围，后者保存底层舵机校准。校准重新写入后应复核旧动作和录制的兼容性</td>
 </tr>
 <tr>
+<td>用户数据目录中的 <code>so101-human-follow/&lt;项目路径标识&gt;/gaze_calibration.json</code></td>
+<td>保存注视方向标定与设备元数据；项目路径、相机或校准发生变化时可能需要重新标定</td>
+</tr>
+<tr>
 <td><code>action_library/</code></td>
 <td>命名动作、介绍、编排、原始轨迹、备份及删除标记</td>
 </tr>
@@ -630,11 +664,11 @@ TeachRecorder → 主臂读数 ────────────────�
 </tr>
 <tr>
 <td><code>models/</code>、<code>scripts/</code></td>
-<td>MediaPipe <code>.task</code> 和下载脚本。MuJoCo MJCF 及网格由独立的 <code>mujoco_sim</code> 目录提供</td>
+<td>MediaPipe <code>.task</code>／BlazeFace、YuNet 模型、对应许可和下载脚本。MuJoCo MJCF 及网格由独立的 <code>mujoco_sim</code> 目录提供</td>
 </tr>
 <tr>
 <td><code>tests/</code></td>
-<td>位姿数学、限位、校准、驱动适配、配置、Flask 路由和控制锁测试</td>
+<td>位姿数学、限位、校准、驱动适配、Flask 路由、注视与陪伴控制，以及前端状态恢复的离线测试</td>
 </tr>
 </tbody>
 </table></div>
@@ -679,7 +713,7 @@ TeachRecorder → 主臂读数 ────────────────�
 <pre tabindex="0"><code class="language-powershell">$env:PYTHONPATH = "src"
 python -B -m unittest discover -s tests -q
 </code></pre>
-<p>1.2 发布检查通过 65 项单元测试。测试使用公开配置，覆盖对话动作可在视觉不可用时运行，以及视觉跟随在判断人或手太近时会停止。在 <code>so101-follow</code> 环境中加载本地 MJCF，获得了六轴状态和 JPEG 渲染结果。实际回位、负载与连贯度仍需按实物验证。 <a href="tests/test_web_api.py">测试源码</a></p>
+<p>1.3 发布检查通过 256 项 Python 单元测试、12 项 Node 离线测试及 4 个前端脚本语法检查。测试使用公开配置与模拟反馈，覆盖注视标定、raw 越界拦截、陪伴恢复、状态 GET 超时及示教按钮恢复，并保留对话无视觉运行、跟随近距离停止等覆盖。历史环境已加载本地 MJCF，获得六轴状态和 JPEG 渲染结果；这些检查不代表所有实机动作已验收，实际回位、负载与跟踪效果仍需按实物验证。 <a href="tests/test_web_api.py">Python 测试</a> · <a href="tests/test_teaching_ui.cjs">示教前端测试</a> · <a href="tests/test_simulation_api.cjs">状态读取测试</a></p>
 <h2 id="10">10. 下一步开发优先级与参考项目</h2>
 <div aria-label="表格，可横向滚动" class="table-scroll" role="region" tabindex="0"><table>
 <thead>

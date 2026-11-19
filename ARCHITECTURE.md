@@ -1,8 +1,18 @@
 # SO-101 项目架构与源码指南
 
-版本 `1.2.0` · 2026 年 11 月 14 日
+版本 `1.3.0` · 2026 年 11 月 19 日
 
-本文介绍 1.2 版的日志、连续回放、本地指令、组合动作和返回连接姿势。部署和入门命令见 [README](README.md)。
+本文介绍 1.3 版的腕部相机注视、陪伴动作和示教状态恢复，并保留已有的日志、连续回放、本地指令、组合动作和返回连接姿势说明。部署和入门命令见 [README](README.md)。
+
+## 版本 1.3 新增路径
+
+1. **人脸目标。** 腕部相机画面中的 BlazeFace 候选经 OpenCV YuNet 复核和连续帧确认后，作为注视标定目标；可靠的人体头部关键点可供运行期回退，标定只接受经过复核的独立人脸。见 [pose_detector.py](src/so101_human_follow/pose_detector.py)。
+2. **方向标定与闭环。** 显式点击后先倒计时，再等待设备和稳定人脸。底座、腕部分别做小幅探测，以编码器到位后的新图像测得二维响应矩阵；`ImageGazeController` 根据实测关系纠偏，保留死区、限速、限位、陈旧帧及发散检查。见 [gaze_controller.py](src/so101_human_follow/gaze_controller.py)。
+3. **陪伴运动与控制权。** `CompanionMotion` 叠加肩肘周期动作和腕部补偿，人脸靠近画面边缘时减小身体动作。视觉计算与串口控制分开，实际读写仍由同一个控制线程串行执行。语音监听、普通聊天可继续；真正的 Agent 机械动作暂时接管，结束后从实测位置恢复陪伴。见 [companion.py](src/so101_human_follow/companion.py) 与 [web_engine.py](src/so101_human_follow/web_engine.py)。
+4. **原始反馈与存储。** 探测和陪伴核对同批 raw／归一化位置；底座或腕部 raw 超出舵机校准记录时停止，不把被截断的 `-100/100` 当成有效端点继续运动。注视结果由 `gaze_storage.py` 保存到用户数据目录，绑定相机、机器人校准指纹和限位；启动只加载匹配结果，不自动启动运动。见 [robot_adapter.py](src/so101_human_follow/robot_adapter.py) 与 [gaze_storage.py](src/so101_human_follow/gaze_storage.py)。
+5. **前端恢复。** 首页提供视频跟随、对话、仿真与动作编辑、陪伴四个入口，陪伴界面可连接设备并对话。示教请求有即时连接反馈和简短舵机错误；只读状态 GET（含响应正文）最多等待 5 秒，POST 完成后先清理等待状态再同步，状态未知时保留同步门及显式取消入口。机械操作 POST 不自动重发，网络中止不代表硬件命令已停止。见 [static/teaching.js](src/so101_human_follow/static/teaching.js) 与 [static/simulation.js](src/so101_human_follow/static/simulation.js)。
+
+这些改动提供检测、拒绝和恢复机制，不代表修复了舵机掉线或底层零点偏移溢出；真实行程、安装方向、供电与线缆仍须按设备核查。
 
 ## 1. 当前项目能做什么
 
@@ -10,6 +20,7 @@
 | --- | --- | --- |
 | 视频跟随 | 电脑摄像头识别右臂与右手，驱动 SO-101 的 ID3–ID6 | 首页连接从臂、连接相机、采集中立姿势、ARM。ID1–ID2 固定。视觉在本地推理 |
 | 文字／语音 Agent | 输入或说出「打开夹爪」「点头两次」「摸摸头」，也可以发一句有先后顺序的指令 | 固定明确指令可在本地规划，开放式对话、语义选用自定义动作和部分补充式插话走配置的云模型。真机动作需要从臂连接及安全范围 |
+| 腕部相机陪伴 | 在陪伴界面连接从臂和腕部相机，完成注视方向标定后开启，边做肩肘动作边纠偏 | 使用经确认的头部目标、实测局部响应及舵机反馈；丢帧、发散或原始读数越过校准记录时保持／拒绝运动，搜索需显式允许 |
 | 返回连接姿势 | 说「返回原位」或「回到连接时的位置」 | 回到本次连接时单独保存的六轴实测位置。工作范围重采集后仍使用这份记录，若超出新范围则提示 |
 | 对话和动作并行 | 明确的单动作通过本地校验后可先启动，语音并行准备。多动作和云端动作可等实际开播后开始 | 音频时钟和舵机时钟分别推进。支持中途插话取消旧交互，精确逐句同步和全双工流式对话仍待实现 |
 | 对话记忆 | 已完成对话写入本机记忆，按批次生成性格与记忆摘要 | 云端摘要需要已配置的模型和 Key。Agent 名称与音色、语言设置可单独保存 |
@@ -18,7 +29,7 @@
 | 真机连续回放 | 选择带从臂实测轨迹的录制 →「真机连续回放」 | 从臂先到录制起点，再沿时间轨迹播放。需要同一校准指纹与有效限位。缺少校准记录的老轨迹仍可在 MuJoCo 预览 |
 | 动作复用 | 将已保存动作组合，设置每项播放方式、顺序、重复和间隔，可选整体回位 | 组合引用原动作及其版本。引用变动后需要复核，可载入编辑或删除动作 |
 
-**验证状态。** 历史实机记录确认过视频跟随的 ID3 和 ID6。此次 P0–P3 已用模拟舵机验证录制、JSON 保存、起点过渡、连续回放、停止和偏差拦截，组合动作也经过 Flask 接口和 MuJoCo 预览验证。真实动作方向、供电负载下的连贯度、夹爪开合效果和语音起播延迟需要在实际设备上测量。
+**验证状态。** 1.3 发布检查通过 256 项 Python 单元测试、12 项 Node 离线测试及 4 个前端脚本语法检查。历史实机记录确认过视频跟随的 ID3 和 ID6；录制、回放、注视闭环、raw 越界拦截与示教恢复使用模拟反馈或离线页面桩验证。真实动作方向、供电负载下的连贯度、夹爪开合效果、相机跟踪与语音起播延迟仍需在实际设备上测量。
 
 ## 2. 技术栈与运行入口
 
@@ -27,7 +38,7 @@
 | 运行环境 | Python 3.10、setuptools | `src` 包布局，Web 与命令行两个入口 |
 | 本地服务 | Flask 3.1 系列、Werkzeug、Jinja | 渲染页面、收发 JSON、状态轮询、输出视频与仿真图像 |
 | 前端 | 原生 HTML、CSS、JavaScript | 粉色和白色主题，视频、对话、仿真与示教界面，无独立前端构建流程 |
-| 相机与视觉 | Windows DirectShow、OpenCV、MediaPipe Tasks、NumPy | 枚举并按名称连接相机，采集、旋转和标注画面，提取人体及手部关键点 |
+| 相机与视觉 | Windows DirectShow、OpenCV、MediaPipe Tasks、BlazeFace、YuNet、NumPy | 枚举并按名称连接相机，采集、旋转和标注画面，提取人体／手部关键点，复核独立人脸并提供注视目标 |
 | 总线 | LeRobot、Feetech 串行舵机 | SO-101 主臂／从臂、编码器、扭矩设置、同步读写、归一化位置和 EEPROM 校准 |
 | 动作与仿真 | 本地 Python 轨迹计算、MuJoCo 3.x、MJCF | 构造动作计划、计算时序、渲染 SO-101 模型、回放示教与编排 |
 | 语言模型 | OpenAI-compatible Chat Completions 和 Function Calling、httpx | 复杂对话生成结构化语义动作，短指令可由本地解析处理 |
@@ -48,7 +59,8 @@
   ├─ simulation.js ─── 仿真／编排／真机试运行 ─── Flask → ActionLibrary
   └─ teaching.js ───── 主从臂设置／录制 ───────── Flask     │
                                                            ▼
-相机线程 → MediaPipe → 特征及预览 ──────────────── ControlEngine
+相机线程 → MediaPipe／YuNet → 特征及预览 ──────── ControlEngine
+头部目标 → 注视闭环／CompanionMotion ──────────────┤
 AgentService → 已校验语义计划 → 适配成控制命令 ───────┤
 ActionLibrary → 关键帧或从臂轨迹 → 适配成控制命令 ─────┤
 TeachRecorder → 主臂读数 ──────────────────────────┤
@@ -70,11 +82,14 @@ TeachRecorder → 主臂读数 ────────────────�
 | [web_engine.py](src/so101_human_follow/web_engine.py#L118) | `heartbeat`、`submit`、`disarm`、`_run`、`_vision_loop` | 管理租约、硬件与相机状态。控制线程接收命令，视觉线程采集和识别，状态供网页轮询 |
 | [config.py](src/so101_human_follow/config.py#L121) | `load_config`、`validate_config`、`AppConfig`、`ALL_JOINTS` | 将 JSON 转为类型化的相机、映射、机器人、安全配置；检查关节集合、数值与方向 |
 | [camera_device.py](src/so101_human_follow/camera_device.py#L127) | `list_camera_names`、`camera_index_by_name` | Windows DirectShow 枚举设备名称，返回 OpenCV 可使用的设备索引 |
-| [pose_detector.py](src/so101_human_follow/pose_detector.py#L91) | `MediaPipePoseDetector.detect`、`_select_hand`、`orient_camera_frame`、`annotate_frame` | 从画面生成 `PoseDetection`，关联手部与目标腕部，并绘制预览 |
+| [pose_detector.py](src/so101_human_follow/pose_detector.py) | `MediaPipePoseDetector.detect`、`_VerifiedHeadTracker`、`_YuNetFaceVerifier`、`annotate_frame` | 从画面生成 `PoseDetection`，关联手部与目标腕部，复核人脸和目标连续性，并绘制预览 |
+| [gaze_controller.py](src/so101_human_follow/gaze_controller.py) | `GazeCalibrator`、`GazeCalibration`、`ImageGazeController.update` | 小幅两轴探测、实测响应矩阵与阻尼图像纠偏；纯数学计算，不直接操作硬件 |
+| [gaze_storage.py](src/so101_human_follow/gaze_storage.py) | `gaze_state_path`、`atomic_write_gaze`、`read_gaze` | 按项目命名空间保存与校验用户数据目录中的注视标定结果 |
+| [companion.py](src/so101_human_follow/companion.py) | `CompanionMotion.step`、`resume_from`、`head_target` | 生成相对当前姿态的陪伴目标，叠加肩肘表达、腕部补偿、注视纠偏和可靠手势的夹爪目标 |
 | [pose_math.py](src/so101_human_follow/pose_math.py#L185) | `extract_arm_feature_channels`、`extract_hand_feature_channels`、`median_features` | 从关键点提取各通道特征及可靠性，供视觉跟随与中立姿势采集 |
 | [safety.py](src/so101_human_follow/safety.py#L134) | `MotionController.compute`、`reset_to`、`signed_deadband`、`ema`、`slew_limit` | 把人体特征映射为六轴归一化目标，应用固定关节、死区、平滑、限位、限速 |
 | [safe_range.py](src/so101_human_follow/safe_range.py#L21) | `SafeRangeProfile`、`load_safe_range_profile`、`save_safe_range_profile` | 管理固定位置、视觉工作范围、机器人 ID 与校准指纹 |
-| [robot_adapter.py](src/so101_human_follow/robot_adapter.py#L31) | `SO101RobotAdapter.connect`、`read_positions`、`send_agent_targets`、`hold_current`、`SO101CalibrationSession` | 对接 Feetech 和 LeRobot。返回实测、实发位置，处理校准核对、同步写入和扭矩 |
+| [robot_adapter.py](src/so101_human_follow/robot_adapter.py) | `SO101RobotAdapter.connect`、`read_calibration_observation`、`send_agent_targets`、`hold_raw_current`、`SO101CalibrationSession` | 对接 Feetech 和 LeRobot。核对校准、同批 raw／归一化反馈、实测与实发位置，处理同步写入和扭矩 |
 | [speech_normalizer.py](src/so101_human_follow/speech_normalizer.py#L81) | `normalize_speech` | 转写标准化、名称前缀、常见误识别和次数修正，以及本地 STOP 辨认 |
 | [agent_schema.py](src/so101_human_follow/agent_schema.py#L176) | `build_fixed_intent_plan`、`build_system_prompt`、`InteractionPlan` | 完整固定指令本地解析；定义云端工具格式、动作名称和参数边界 |
 | [agent_client.py](src/so101_human_follow/agent_client.py#L82) | `OpenAICompatibleClient`、`validate_base_url` | 把请求发送给兼容模型，验证工具调用、处理超时、取消和错误脱敏 |
@@ -235,12 +250,13 @@ TeachRecorder → 主臂读数 ────────────────�
 | --- | --- |
 | `config.example.json`、`config.json` | 分别是可公开模板和本机硬件／相机／限位配置 |
 | `safety_profile.json`、LeRobot 校准目录 | 前者保存采集的工作范围，后者保存底层舵机校准。校准重新写入后应复核旧动作和录制的兼容性 |
+| 用户数据目录中的 `so101-human-follow/<项目路径标识>/gaze_calibration.json` | 保存注视方向标定与设备元数据；项目路径、相机或校准发生变化时可能需要重新标定 |
 | `action_library/` | 命名动作、介绍、编排、原始轨迹、备份及删除标记 |
 | `agent_preferences.json`、`agent_preferences.backup.json` | 可恢复的非密钥设置 |
 | `agent_memory.json` | 对话记忆、近期消息及摘要进度 |
 | `logs/control.log` | 滚动保存控制日志。单份上限约 5 MiB，保留最多 5 份归档 |
-| `models/`、`scripts/` | MediaPipe `.task` 和下载脚本。MuJoCo MJCF 及网格由独立的 `mujoco_sim` 目录提供 |
-| `tests/` | 位姿数学、限位、校准、驱动适配、配置、Flask 路由和控制锁测试 |
+| `models/`、`scripts/` | MediaPipe `.task`／BlazeFace、YuNet 模型、对应许可和下载脚本。MuJoCo MJCF 及网格由独立的 `mujoco_sim` 目录提供 |
+| `tests/` | 位姿数学、限位、校准、驱动适配、Flask 路由、注视与陪伴控制，以及前端状态恢复的离线测试 |
 
 本机数据的忽略项见 [.gitignore](.gitignore)。本机配置模板可用于团队分发；含有实际轨迹、日志、音频相关信息与个人对话的文件应按项目数据范围处理。
 
@@ -259,7 +275,7 @@ $env:PYTHONPATH = "src"
 python -B -m unittest discover -s tests -q
 ```
 
-1.2 发布检查通过 65 项单元测试。测试使用公开配置，覆盖对话动作可在视觉不可用时运行，以及视觉跟随在判断人或手太近时会停止。在 `so101-follow` 环境中加载本地 MJCF，获得了六轴状态和 JPEG 渲染结果。实际回位、负载与连贯度仍需按实物验证。 [测试源码](tests/test_web_api.py)
+1.3 发布检查通过 256 项 Python 单元测试、12 项 Node 离线测试及 4 个前端脚本语法检查。测试使用公开配置与模拟反馈，覆盖注视标定、raw 越界拦截、陪伴恢复、状态 GET 超时及示教按钮恢复，并保留对话无视觉运行、跟随近距离停止等覆盖。历史环境已加载本地 MJCF，获得六轴状态和 JPEG 渲染结果；这些检查不代表所有实机动作已验收，实际回位、负载与跟踪效果仍需按实物验证。 [Python 测试](tests/test_web_api.py) · [示教前端测试](tests/test_teaching_ui.cjs) · [状态读取测试](tests/test_simulation_api.cjs)
 
 ## 10. 下一步开发优先级与参考项目
 
